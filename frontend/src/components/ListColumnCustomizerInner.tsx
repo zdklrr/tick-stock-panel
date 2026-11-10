@@ -1363,12 +1363,12 @@ function extGranularityOf(
           <motion.div
             initial={{ scale: 0.97, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.97, opacity: 0 }}
             transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
-            className="relative w-[900px] max-w-[94vw] max-h-[min(720px,82vh)] bg-base border border-border rounded-card shadow-2xl flex flex-col overflow-hidden"
+            className="relative w-full max-w-[94vw] max-h-[min(720px,82vh)] bg-base border border-border rounded-card shadow-2xl flex flex-col overflow-hidden sm:w-[900px]"
           >
-            {/* 头部: 标题 + 全局搜索 + 已选计数 + 关闭 */}
-            <div className="flex items-center gap-3 px-4 py-2.5 border-b border-border shrink-0">
+            {/* 头部: 标题 + 全局搜索 + 已选计数 + 关闭 (窄屏换行, 搜索框独占一行) */}
+            <div className="flex flex-wrap items-center gap-2 px-3 py-2.5 border-b border-border shrink-0 sm:gap-3 sm:px-4">
               <h3 className="text-sm font-medium text-foreground shrink-0">{title}</h3>
-              <div className="relative flex-1 max-w-[300px]">
+              <div className="relative order-last w-full min-w-0 flex-1 sm:order-none sm:max-w-[300px]">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted" />
                 <input
                   type="text"
@@ -1394,11 +1394,12 @@ function extGranularityOf(
             </div>
 
             {/* 两栏: 左=所有可选列, 右=已选择 (配置在已选行下方就地展开)。
+                窄屏 (<640px) 改为上下堆叠, 左右各占半高, 避免 340px 固定左栏把右栏挤没。
                 弹窗高度自适应内容: min-h 下限防列少时过扁, 超过 max-h 时本行
                 收缩、两栏列表各自滚动。 */}
-            <div className="flex-1 flex min-h-[260px]">
+            <div className="flex-1 flex min-h-[260px] flex-col sm:flex-row">
               {/* ── 左栏: 所有列 ── */}
-              <div className="w-[340px] shrink-0 border-r border-border flex flex-col min-h-0 bg-surface/20">
+              <div className="flex min-h-0 w-full shrink-0 flex-col border-b border-border bg-surface/20 sm:w-[340px] sm:border-b-0 sm:border-r">
                 <div className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 shrink-0">
                   <span className="text-[10px] font-semibold text-muted uppercase tracking-wider">{builtinSectionLabel}</span>
                   <span className="text-[10px] text-muted">勾选即加入</span>
@@ -1560,7 +1561,7 @@ function extGranularityOf(
                 onClick={() => setConfirmReset(false)}
               >
                 <div
-                  className="w-[360px] rounded-card border border-border bg-base p-4 shadow-2xl"
+                  className="w-[calc(100%-1.5rem)] max-w-[360px] rounded-card border border-border bg-base p-4 shadow-2xl"
                   onClick={e => e.stopPropagation()}
                 >
                   <h4 className="text-sm font-medium text-foreground mb-1.5">确认恢复默认？</h4>

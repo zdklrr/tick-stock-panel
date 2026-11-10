@@ -4,12 +4,19 @@
 挂起), 其中持锁者让 _write_lock 永久被占, 所有请求线程排队冻结, 只能人工
 重启。并发闸 (app.polars_guard) 与写锁瘦身 (repository 乐观并发) 分别削减
 触发概率与扩散半径; 看门狗是最后一层兜底 —— 探测走与事故相同的共享资源
-路径 (collect 闸 + 全局写锁), 连续 N 次超时即判定进程已僵死, 主动退出交由
-supervisor / Docker restart / dev 脚本拉起, 把恢复时间从"人工发现"缩短到
-约一分钟。
+路径 (collect 闸 + 全局写锁): collect 挂死计为失败, 连续 N 次失败即判定
+进程已僵死, 主动退出交由 supervisor / Docker restart / dev 脚本拉起, 把
+恢复时间从"人工发现"缩短到约一分钟。
+
+写锁忙不算失败: 每日管道 (sync_adj / compute_enriched / enriched warmup)
+会长时间持有 repo._write_lock, 属正常后台忙, 写锁 acquire 超时只记 WARNING,
+不计入 failure_threshold —— 否则管道忙时会误判进程僵死并自杀重启
+(2026-11 NAS 事故: 管道持锁 → watchdog 连续 probe 失败 → 进程退出 →
+regime/mainline 阶段没跑到, 情绪周期停更)。
 
 误伤防护: 探测本身是毫秒级微型 collect + 1s 写锁试探, 阈值要求连续失败
-(默认 2 次 × 15s 超时), 高负载下"慢而未死"不会触发。
+(默认 2 次 × 15s 超时), 高负载下"慢而未死"不会触发; 只有 collect 真正
+挂死 (0 CPU 永久悬起, 1s 内不会返回) 才会累计失败。
 """
 from __future__ import annotations
 
@@ -31,13 +38,21 @@ logger = logging.getLogger(__name__)
 def default_probe(write_lock: threading.Lock | None = None) -> None:
     """探测关键共享资源: polars collect 闸 + 仓库全局写锁。
 
-    任一被悬死线程占住即超时 — 正是 2026-09-07 冻结事故中被毒化的两条路径。
+    collect 失败/超时 = 进程僵死信号 (2026-09-07 事故即 collect 挂死),
+    照常抛异常计失败。写锁 acquire 失败 = 后台管道正常持锁忙, 不抛异常
+    只记 WARNING —— 写锁被长任务持有属正常忙, 不累计 failure_threshold,
+    否则管道 (compute_enriched / enriched warmup) 忙时会误触发自杀重启。
     """
     guarded_collect(pl.LazyFrame({"probe": [1]}).sum())
     if write_lock is not None:
         acquired = write_lock.acquire(timeout=1.0)
         if not acquired:
-            raise TimeoutError("repository write lock unavailable")
+            # 写锁被后台管道持有: 记日志正常返回, 不计探测失败。
+            logger.warning(
+                "watchdog: write lock held >1s (likely background pipeline), "
+                "not counted as failure"
+            )
+            return
         write_lock.release()
 
 

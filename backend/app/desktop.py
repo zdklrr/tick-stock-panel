@@ -29,6 +29,20 @@ from typing import BinaryIO
 logger = logging.getLogger(__name__)
 
 _APP_NAME = "TSP"
+
+
+def _window_title() -> str:
+    """窗口标题带上版本号。
+
+    用户升级后无需打开任何页面, 直接从标题栏就能确认版本是否已更新;
+    取版本失败时退回纯应用名, 版本号绝不阻塞窗口创建。
+    """
+    try:
+        from app import __version__
+
+        return f"{_APP_NAME} v{__version__}"
+    except Exception:  # noqa: BLE001
+        return _APP_NAME
 _BASE_PORT = 3018
 _PORT_PROBE_RANGE = 50  # 从 3018 起最多试 50 个端口
 _instance_lock: BinaryIO | None = None
@@ -359,7 +373,7 @@ def _open_window(url: str) -> None:
     # 配置备份导出、回测 CSV 等 <a download> 直链会点击无反应, 必须在 start() 前显式开启。
     webview.settings["ALLOW_DOWNLOADS"] = True
     window = webview.create_window(
-        _APP_NAME,
+        _window_title(),
         url,
         width=1440,
         height=900,
@@ -376,7 +390,7 @@ def _open_static_window(html_text: str) -> None:
     import webview  # type: ignore[import-not-found]
 
     window = webview.create_window(
-        _APP_NAME,
+        _window_title(),
         html=html_text,
         width=560,
         height=360,

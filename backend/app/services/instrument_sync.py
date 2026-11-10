@@ -8,6 +8,8 @@ Starter+ 盘后可用 quotes.get(universes) 顺便补充 name。
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -95,10 +97,24 @@ def sync_instruments(data_dir: Path) -> int:
         return 0
 
     df = pl.DataFrame(all_rows)
+    out = data_dir / "instruments" / "instruments.parquet"
+
+    # 缩表护栏: 免费/降级行情源只返回部分市场 (曾把 5890 行完整维表冲成 2823 行,
+    # 且只覆盖沪市 → 深市持仓与选股全部查不到名称/股本)。新结果比现有维表小就
+    # 说明源不完整, 直接拒绝写入并保留旧表, 绝不「成功」一次退化。
+    existing = _read_existing(out)
+    if existing is not None and df.height < existing.height:
+        logger.warning(
+            "instruments 拒绝缩表: 新源仅 %d 行 < 现有 %d 行 (行情源不完整?), 保留旧维表",
+            df.height, existing.height,
+        )
+        return 0
+
     df = _preserve_share_fields(df, data_dir)
+    # 新源整行缺失的标的 (按 symbol) 从旧维表补回, 不让它们凭空消失
+    df = _restore_missing_symbols(df, existing)
     df = df.with_columns(pl.lit(date.today()).alias("as_of"))
 
-    out = data_dir / "instruments" / "instruments.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_parquet(df, out)
 
@@ -106,13 +122,64 @@ def sync_instruments(data_dir: Path) -> int:
     return df.height
 
 
+def _read_existing(path: Path) -> pl.DataFrame | None:
+    """读现有维表 (不存在/损坏返回 None, 不阻断同步)。"""
+    if not path.exists():
+        return None
+    try:
+        return pl.read_parquet(path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("instruments 现有维表读取失败: %s", e)
+        return None
+
+
+def _restore_missing_symbols(df: pl.DataFrame, existing: pl.DataFrame | None) -> pl.DataFrame:
+    """把新源里整行缺失的 symbol 从旧维表补回 (按 symbol 反连接)。"""
+    if existing is None or "symbol" not in df.columns or "symbol" not in existing.columns:
+        return df
+    try:
+        missing = existing.join(df.select("symbol"), on="symbol", how="anti")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("instruments 缺失标的补回失败: %s", e)
+        return df
+    if missing.is_empty():
+        return df
+    # 对齐列: 旧表多出的列置 null, 新表多出的列同样补 null
+    common = [c for c in df.columns if c in missing.columns]
+    try:
+        merged = pl.concat([df.select(common), missing.select(common)], how="vertical_relaxed")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("instruments 旧表补回拼接失败: %s", e)
+        return df
+    logger.info("instruments 从旧维表补回 %d 个缺失标的", missing.height)
+    return merged
+
+
 # 股本与交易规则字段: 部分行情源的标的维表只有代码/名称/市场/类型。
 # 这些字段缺失会让 enriched 的 turnover_rate / 市值 / 涨跌停判定全空, 进而使
 # 依赖换手率与流通市值的策略筛不出任何标的 —— 因此绝不能用 null 覆盖已有值。
+# name 一并纳入: 免费源偶尔把 name 填成占位符 (等于 code/symbol) 或留空,
+# 这里按「缺失」处理并用历史值兜回, 否则持仓/自选/监控全部显示不出中文名。
 _SHARE_FIELDS = (
-    "listing_date", "total_shares", "float_shares", "tick_size",
+    "name", "listing_date", "total_shares", "float_shares", "tick_size",
     "limit_up", "limit_down",
 )
+
+#: 视为「name 缺失」的占位值 —— 免费源常用代码自填充, 不能当成有效名称。
+_NAME_PLACEHOLDER_COLUMNS = ("name",)
+
+
+def _missing_mask(df: pl.DataFrame, cols: list[str]):
+    """各列「缺失」的并集布尔掩码 (name 把占位符算缺失); 无列返回 None。"""
+    mask = None
+    for col in cols:
+        cond = pl.col(col).is_null()
+        if col in _NAME_PLACEHOLDER_COLUMNS and "symbol" in df.columns:
+            name = pl.col(col).cast(pl.Utf8, strict=False).str.strip_chars()
+            code = pl.col("symbol").cast(pl.Utf8, strict=False).str.split(".").list.first()
+            cond = cond | (name == "") | (name == pl.col("symbol").cast(pl.Utf8, strict=False)) | (name == code)
+        mask = cond if mask is None else (mask | cond)
+    return mask
 
 
 def _preserve_share_fields(df: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
@@ -124,8 +191,10 @@ def _preserve_share_fields(df: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
     available = [c for c in _SHARE_FIELDS if c in df.columns]
     if not available:
         return df
-    if all(df[c].null_count() == 0 for c in available):
-        return df  # provider 已提供全部字段, 无需补全
+    # name 的「占位符」(空串 / 等于代码) 也算缺失, 故不能只看 null_count
+    missing_mask = _missing_mask(df, available)
+    if missing_mask is not None and not bool(df.select(missing_mask.any()).item()):
+        return df  # provider 已提供全部字段且无占位符, 无需补全
 
     path = data_dir / "instruments" / "instruments.parquet"
     if not path.exists():
@@ -153,6 +222,27 @@ def _preserve_share_fields(df: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
             continue
         # 逐行 coalesce: provider 有值用 provider, 为空才回落历史值。这样
         # 「部分标的缺字段」也能补齐, 而不只处理整列为空的源。
+        if col == "name":
+            # name 还要把占位符 (空串 / 等于 symbol 或 code) 当成缺失
+            bad = (
+                pl.col(col).is_null()
+                | (pl.col(col).cast(pl.Utf8, strict=False).str.strip_chars() == "")
+            )
+            if "symbol" in merged.columns:
+                code_col = pl.col("symbol").cast(pl.Utf8, strict=False).str.split(".").list.first()
+                bad = bad | (
+                    pl.col(col).cast(pl.Utf8, strict=False) == pl.col("symbol").cast(pl.Utf8, strict=False)
+                ) | (
+                    pl.col(col).cast(pl.Utf8, strict=False) == code_col
+                )
+            if bool(merged.select(bad.any()).item()) and bool(
+                merged.select(pl.col(prev).is_not_null().any()).item()
+            ):
+                merged = merged.with_columns(
+                    pl.when(bad).then(pl.col(prev)).otherwise(pl.col(col)).alias(col)
+                )
+                filled.append(col)
+            continue
         if merged[col].null_count() and merged[prev].is_not_null().any():
             merged = merged.with_columns(
                 pl.coalesce(pl.col(col), pl.col(prev)).alias(col)
@@ -216,3 +306,61 @@ def enrich_names_from_quotes(
     atomic_write_parquet(df, inst_path)
     logger.info("instruments name enriched from quotes: %d names", len(name_map))
     return len(name_map)
+
+
+# ── 名称在线兜底 (仅用于展示, 不回写维表) ────────────────────
+# 背景: 维表曾被降级源冲成「只剩沪市 2823 行」, 之后的深市持仓在台账里也没有
+# name, 于是持仓表只剩代码。维表修复要等下一次全量 sync; 但展示不能等 ——
+# 腾讯批快照里每个标的都自带中文名, 按持仓那几十只逐个查即可, 代价可忽略。
+_NAME_LOOKUP_TTL_S = 600.0
+_NAME_LOOKUP_MAX = 200
+_name_lookup_cache: dict[str, tuple[float, str]] = {}
+_name_lookup_lock = threading.Lock()
+
+
+def lookup_names_online(symbols: list[str]) -> dict[str, str]:
+    """腾讯批快照按代码查中文名 (展示用兜底, 不回写维表)。
+
+    命中进程内 10 分钟缓存; 网络失败软返回已缓存的部分, 永不抛异常。
+    symbols 超过 _NAME_LOOKUP_MAX 时只取前 N 个 (持仓不会到这么多)。
+    """
+    want = [s for s in dict.fromkeys(symbols) if s][:_NAME_LOOKUP_MAX]
+    if not want:
+        return {}
+    now = time.monotonic()
+    out: dict[str, str] = {}
+    todo: list[str] = []
+    with _name_lookup_lock:
+        for sym in want:
+            hit = _name_lookup_cache.get(sym)
+            if hit is not None and now - hit[0] < _NAME_LOOKUP_TTL_S:
+                out[sym] = hit[1]
+            else:
+                todo.append(sym)
+    if not todo:
+        return out
+    try:
+        from app.plugins.tencent.client import TencentClient
+        from app.plugins.tencent.provider import _map_row
+
+        client = TencentClient(timeout=6.0)
+        try:
+            rows = client.fetch(todo)
+        finally:
+            client.close()
+        fetched: dict[str, str] = {}
+        now_ms = int(time.time() * 1000)
+        for sym, fields in rows.items():
+            rec = _map_row(sym, fields, now_ms)
+            if not rec:
+                continue
+            nm = str(rec.get("name") or "").strip()
+            if nm and nm != sym and nm != sym.split(".")[0]:
+                fetched[sym] = nm
+        with _name_lookup_lock:
+            for sym, nm in fetched.items():
+                _name_lookup_cache[sym] = (now, nm)
+        out.update(fetched)
+    except Exception as e:  # noqa: BLE001 — 名称兜底失败不影响任何业务
+        logger.warning("instruments 在线名称兜底失败: %s", e)
+    return out

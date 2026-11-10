@@ -6,7 +6,8 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
 
 CN_TZ = timezone(timedelta(hours=8))
 
@@ -35,6 +36,37 @@ def in_continuous_session(now: datetime | None = None) -> bool:
         _MORNING_START <= now.time() <= _MORNING_END
         or _AFTERNOON_START <= now.time() <= _AFTERNOON_END
     )
+
+
+#: 「当日数据还会在变」的窗口 (北京时间): 集合竞价 9:15 开始 → 收盘定型 15:05。
+#: 这个窗口里日K/情绪周期都还没定型, 需要高频复查; 窗口外按天级节奏就够了。
+_AUCTION_START = dt_time(9, 15)
+_CLOSE_SETTLED = dt_time(15, 5)
+
+
+def in_data_refresh_window(now: datetime | None = None) -> bool:
+    """当日行情/日K 还在变的时段 (工作日 9:15-15:05), 用于决定刷新频率。
+
+    背景 (v0.3.45): 用户在竞价结束 (09:25) 就打开页面, 情绪周期与大盘择时
+    还停在昨天 —— 后台补算原本 30 分钟才跑一次, 盘中更是要等半小时。
+    窗口内按分钟级复查, 窗口外回到 30 分钟一次。
+    """
+    now = now or cn_now()
+    return now.weekday() < 5 and _AUCTION_START <= now.time() <= _CLOSE_SETTLED
+
+
+#: 窗口内/外的复查间隔 (秒) —— 见 `data_refresh_interval_seconds`。
+_REFRESH_INTERVAL_ACTIVE = 180
+_REFRESH_INTERVAL_IDLE = 1800
+
+
+def data_refresh_interval_seconds(now: datetime | None = None) -> int:
+    """后台「择时/情绪周期」补算的复查间隔 (秒)。
+
+    当日数据还在变 (竞价 09:15 - 收盘定型 15:05) → 3 分钟一次;
+    其余时段 → 30 分钟一次 (日K 一天才定型一次, 不用更勤)。
+    """
+    return _REFRESH_INTERVAL_ACTIVE if in_data_refresh_window(now) else _REFRESH_INTERVAL_IDLE
 
 
 def trading_minutes_elapsed_from_dt(dt: datetime) -> float:

@@ -1095,6 +1095,16 @@ def limit_ladder(
     count_down_raw = int(df.filter(pl.col("signal_limit_down").fill_null(False)).height) if "signal_limit_down" in df.columns else 0
 
     # 双方向 sealed 修正: 减去各自的假涨停(假涨停已归炸板, 不计入涨停数)
+    # 只修正**当前确实被判为涨跌停**的标的: depth5 快照可能来自更早的判定口径
+    # (如维表 limit_up 陈旧导致的历史误判), 不做交集会重复扣减。
+    _up_syms = (
+        set(df.filter(pl.col("signal_limit_up").fill_null(False))["symbol"].to_list())
+        if "signal_limit_up" in df.columns else set()
+    )
+    _down_syms = (
+        set(df.filter(pl.col("signal_limit_down").fill_null(False))["symbol"].to_list())
+        if "signal_limit_down" in df.columns else set()
+    )
     depth_svc_global = getattr(request.app.state, "depth_service", None)
     fake_up = 0
     fake_down = 0
@@ -1106,9 +1116,15 @@ def limit_ladder(
         sealed_up_ready = bool(up_map) and depth_svc_global.is_sealed_ready(as_of)
         sealed_down_ready = bool(down_map) and depth_svc_global.is_sealed_ready(as_of)
         if up_map:
-            fake_up = sum(1 for v in up_map.values() if v.get("sealed") is False)
+            fake_up = sum(
+                1 for sym, v in up_map.items()
+                if v.get("sealed") is False and sym in _up_syms
+            )
         if down_map:
-            fake_down = sum(1 for v in down_map.values() if v.get("sealed") is False)
+            fake_down = sum(
+                1 for sym, v in down_map.items()
+                if v.get("sealed") is False and sym in _down_syms
+            )
     count_up = count_up_raw - fake_up if sealed_up_ready else count_up_raw
     count_down = count_down_raw - fake_down if sealed_down_ready else count_down_raw
 

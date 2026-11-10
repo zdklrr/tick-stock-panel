@@ -176,6 +176,13 @@ export const QK = {
   regimeCoverage:       ['regime-coverage'] as const,
   regimePhases:         (start?: string, end?: string) => ['regime-phases', start ?? '', end ?? ''] as const,
   regimeMainline:       (kind: string, start?: string, end?: string) => ['regime-mainline', kind, start ?? '', end ?? ''] as const,
+  // 风险雷达 / 盘前简报 — 后端有 45s / 120s 缓存, 前端轮询不设 staleTime 上限;
+  // 键按账户隔离结算回撤那一路系数, 失效用裸前缀 riskAll。
+  riskAll:              ['risk'] as const,
+  riskRadar:            (account?: string) => ['risk', 'radar', account ?? 'default'] as const,
+  riskPremarket:        ['risk', 'premarket'] as const,
+  riskTiming:           (symbol?: string) => ['risk', 'timing', symbol ?? 'default'] as const,
+  riskAdvice:           (account?: string) => ['risk', 'advice', account ?? 'default'] as const,
   // 板块切换 (盘中轮动, 全量分钟聚合) — 30s 前端轮询刷新; seriesKey = 自定义展示板块清单,
   // filterKey = 自动活跃榜行数与排除名单 (会改变结果的参数必须进查询键)
   sectorRotation:       (kind: string, flow?: string, bucket?: number, seriesKey?: string, filterKey?: string) => ['sector-rotation', kind, flow ?? '', bucket ?? 5, seriesKey ?? '', filterKey ?? ''] as const,

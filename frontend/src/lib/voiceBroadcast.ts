@@ -104,6 +104,19 @@ function fmtPctText(pct: number): string {
   return `跌${Math.abs(p).toFixed(1)}%`
 }
 
+/** 把后端文案清洗成「适合念」的形态:
+ *  - 剔除代码括注 (600327.SH / 000001.SZ) — 语音念代码无意义;
+ *  - 剔除匹配目标括注 (跟策略 zdk_hot_leader_yin) — 念的是英文 id;
+ *  - 分隔符「·」念不出来, 换成停顿更自然的逗号。 */
+function sanitizeForSpeech(text: string): string {
+  return text
+    .replace(/\((?:\d{6}\.(?:SH|SZ|BJ))\)/g, '')
+    .replace(/\((?:跟策略|跟监控规则)\s[^)]*\)/g, '')
+    .replace(/\s*·\s*/g, '，')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
 /**
  * 单条告警 → 播报文案。
  * 设计原则: 必念个股名称 (不念代码), source 分类拼接:
@@ -143,11 +156,19 @@ function buildSingleText(a: AlertEvent): string {
     return parts.join(' ')
   }
 
-  // 模拟盘成交: message 已是中文可读文案 ("模拟盘买入成交 1000股 @ 10.01"), 补名称即可
+  // 模拟盘: 后端文案已自解释 (成交/计划/自动跟单都含名称与触发来源), 直接念。
+  // 名称已在文案里时不再前置, 避免「大东方 自动跟单买入 大东方(600327.SH)…」重复;
+  // 语音念代码没有意义, 括注的代码先剔除。
   if (a.source === 'paper') {
-    const parts = [name]
-    if (a.message) parts.push(a.message)
-    return parts.join(' ')
+    const text = sanitizeForSpeech(a.message || '')
+    if (!text) return a.name || '模拟盘通知'
+    if (!a.name || text.includes(a.name)) return text
+    return `${a.name}，${text}`
+  }
+
+  // 风险提示: message 已是完整中文文案 (含分数/系数/涨跌幅), 无标的, 直接念
+  if (a.source === 'risk') {
+    return a.message || '风险提示'
   }
 
   // 价格/异动/其他: message 是条件摘要 (如 "现价 ≥ 100 · 涨幅 5%")

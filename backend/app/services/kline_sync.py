@@ -754,6 +754,7 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
     chunks = chunked(symbols, limit.batch)
     all_dfs: list[pl.DataFrame] = []
     failed_syms: list[str] = []
+    consecutive_fail = 0  # 连续全失败分块计数: 数据源权限失效时提前中止, 不空耗 40s
 
     for i, chunk in enumerate(chunks):
         sleep_between_batches(i, limit.rpm)
@@ -763,16 +764,34 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
             if not normalized.is_empty():
                 all_dfs.append(normalized)
             logger.debug("adj_factor chunk %d/%d: %d symbols", i + 1, len(chunks), len(chunk))
+            # 成功且有数据 → 归零; 空返回不算失败也不算成功 (如 ETF 无除权)
+            if not normalized.is_empty():
+                consecutive_fail = 0
         except SDKCallTimeoutError as e:
             # on_chunk_done 在 try 外, 成败都会走到 → 心跳/取消检查点不缺
             logger.warning("adj_factor chunk %d/%d timed out: %s", i + 1, len(chunks), e)
             failed_syms.extend(chunk)
+            consecutive_fail += 1
         except Exception as e:  # noqa: BLE001
             logger.warning("adj_factor chunk %d/%d failed: %s", i + 1, len(chunks), e)
             failed_syms.extend(chunk)
+            consecutive_fail += 1
 
         if on_chunk_done:
             on_chunk_done(i + 1, len(chunks))
+
+        # 连续多个分块全部失败 (超时/异常且本块没拿到任何数据行): 大概率是
+        # tickflow key 过期等权限失效, 继续逐块拉只会每块都超时空耗 (36 块
+        # ~40s, 拖长管道持锁时间)。提前中止, 剩余标的全部计入 failed_syms。
+        if consecutive_fail >= 3:
+            remaining = [sym for c in chunks[i + 1:] for sym in c]
+            failed_syms.extend(remaining)
+            logger.warning(
+                "adj_factor: 连续 %d 个分块全部失败, 疑似数据源权限失效, "
+                "提前中止剩余 %d 个分块 (%d 个标的)",
+                consecutive_fail, len(chunks) - i - 1, len(remaining),
+            )
+            break
 
     # 部分失败可见化: 失败分块的标的不在 affected 里 → enriched 不会重算它们,
     # 它们会保持**旧的前复权价**直到下次成功同步。聚合一条 WARNING 让其可见。

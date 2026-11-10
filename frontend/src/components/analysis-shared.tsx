@@ -93,7 +93,7 @@ export function AnalysisConfigDialog({
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         exit={{ opacity: 0, scale: 0.95 }}
-        className="bg-surface border border-border rounded-lg shadow-xl w-[420px]"
+        className="bg-surface border border-border rounded-lg shadow-xl w-[calc(100vw-2rem)] max-w-[420px]"
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 pt-3 pb-2">

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, memo } from 'react'
+﻿import { useState, useEffect, useCallback, useMemo, memo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useQuery } from '@tanstack/react-query'
 import { X, Settings2, RotateCcw, Save, Filter, Star, TrendingUp, Sparkles, Layers, Plus, Trash2, SlidersHorizontal } from 'lucide-react'
@@ -94,11 +94,13 @@ type Snapshot = ReturnType<typeof buildSnapshot>
 const PAGE_ANIM = 'animate-in fade-in-0 slide-in-from-bottom-1 duration-150'
 
 // ===== 策略参数/基础参数通用字段行 =====
-const FIELD_LABEL_CLS = 'w-[88px] shrink-0 text-right text-[11px] leading-4 text-secondary'
-// 参数标签通常更长 (如「近60日最少涨停次数」), 单独放宽避免括号内折行
+// 窄屏 (<640px) 标签改为「标签在上、输入在下」的堆叠布局: 固定 88px 宽会把输入框
+// 挤成几像素宽, 中文标签被压成竖排。行容器同时加了 flex-wrap, 标签 w-full 才能换行。
+const FIELD_LABEL_CLS = 'w-full shrink-0 text-left text-[11px] leading-4 text-secondary sm:w-[88px] sm:text-right'
 // 参数标签通常更长 (如「近60日最少涨停次数」), 单独放宽; keep-all 让断行只发生在空格处, 避免拆断括号
-const PARAM_LABEL_CLS = 'w-[116px] shrink-0 text-right text-[11px] leading-4 text-secondary break-keep [overflow-wrap:anywhere]'
-const FIELD_INPUT_CLS = 'h-7 rounded-[6px] border border-border bg-base text-xs font-mono text-foreground focus:outline-none focus:border-accent/50'
+const PARAM_LABEL_CLS = 'w-full shrink-0 text-left text-[11px] leading-4 text-secondary break-keep [overflow-wrap:anywhere] sm:w-[116px] sm:text-right'
+// 窄屏输入框高度 36px (h-9) 以满足手机触摸目标; sm 以上回到紧凑的 28px (h-7)
+const FIELD_INPUT_CLS = 'h-9 rounded-[6px] border border-border bg-base text-xs font-mono text-foreground focus:outline-none focus:border-accent/50 sm:h-7'
 
 // ===== 区间字段（最小 ~ 最大） =====
 export function RangeField({ label, minVal, maxVal, onMinChange, onMaxChange, unit, step }: {
@@ -111,7 +113,7 @@ export function RangeField({ label, minVal, maxVal, onMinChange, onMaxChange, un
   step?: string
 }) {
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex flex-wrap items-center gap-1.5 sm:flex-nowrap">
       <span className={FIELD_LABEL_CLS}>{label}</span>
       <input
         type="number"
@@ -119,7 +121,7 @@ export function RangeField({ label, minVal, maxVal, onMinChange, onMaxChange, un
         onChange={e => onMinChange(e.target.value === '' ? null : Number(e.target.value))}
         placeholder="最小"
         step={step}
-        className={`${FIELD_INPUT_CLS} w-[84px] px-2 text-center`}
+        className={`${FIELD_INPUT_CLS} w-[104px] px-2 text-center sm:w-[84px]`}
       />
       <span className="text-[10px] text-muted">~</span>
       <input
@@ -128,7 +130,7 @@ export function RangeField({ label, minVal, maxVal, onMinChange, onMaxChange, un
         onChange={e => onMaxChange(e.target.value === '' ? null : Number(e.target.value))}
         placeholder="最大"
         step={step}
-        className={`${FIELD_INPUT_CLS} w-[84px] px-2 text-center`}
+        className={`${FIELD_INPUT_CLS} w-[104px] px-2 text-center sm:w-[84px]`}
       />
       {unit && <span className="w-4 shrink-0 text-[10px] text-muted">{unit}</span>}
     </div>
@@ -151,7 +153,7 @@ function RiskPctField({ label, value, onChange, min, max, step = 0.5, unit = '%'
 }) {
   const display = value == null ? '' : String(Math.round(Math.abs(value) * 10000) / 100)
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
       <span className={FIELD_LABEL_CLS}>{label}</span>
       <input
         type="number"
@@ -161,7 +163,7 @@ function RiskPctField({ label, value, onChange, min, max, step = 0.5, unit = '%'
         max={max}
         placeholder="未设置"
         onChange={e => onChange(e.target.value === '' ? null : Math.abs(Number(e.target.value)) / 100)}
-        className={`${FIELD_INPUT_CLS} w-[76px] px-2 text-center`}
+        className={`${FIELD_INPUT_CLS} w-[96px] px-2 text-center sm:w-[76px]`}
       />
       <span className="text-[10px] text-muted">{unit}</span>
     </div>
@@ -180,12 +182,12 @@ const ParamField = memo(function ParamField({ def, value, onChange, onApplyValue
   if (def.type === 'bool') {
     const checked = value === true || value === 'true' || value === 'True'
     return (
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
         <span className={PARAM_LABEL_CLS} title={def.label}>{def.label}</span>
         <button
           type="button"
           onClick={() => onChange(def.id, !checked)}
-          className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors duration-200 cursor-pointer ${
+          className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors duration-200 cursor-pointer before:absolute before:-inset-x-2.5 before:-inset-y-3 before:content-[''] ${
             checked ? 'bg-accent' : 'bg-elevated'
           }`}
           aria-pressed={checked}
@@ -200,7 +202,7 @@ const ParamField = memo(function ParamField({ def, value, onChange, onApplyValue
   }
   if (def.type === 'select' && def.options) {
     return (
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
         <span className={PARAM_LABEL_CLS} title={def.label}>{def.label}</span>
         <select
           value={value ?? def.default}
@@ -222,7 +224,7 @@ const ParamField = memo(function ParamField({ def, value, onChange, onApplyValue
   }
   if (def.type === 'string') {
     return (
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
         <span className={PARAM_LABEL_CLS} title={def.label}>{def.label}</span>
         <input
           type="text"
@@ -236,7 +238,7 @@ const ParamField = memo(function ParamField({ def, value, onChange, onApplyValue
 
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
       <span className={PARAM_LABEL_CLS} title={def.label}>{def.label}</span>
       <input
         type="number"
@@ -245,7 +247,7 @@ const ParamField = memo(function ParamField({ def, value, onChange, onApplyValue
         step={def.step ?? 0.1}
         min={def.min}
         max={def.max}
-        className={`${FIELD_INPUT_CLS} w-24 px-2 text-center`}
+        className={`${FIELD_INPUT_CLS} w-full max-w-[120px] px-2 text-center sm:w-24`}
       />
       {def.min != null && def.max != null && (
         <span className="whitespace-nowrap text-[10px] text-muted/60">{def.min}~{def.max}</span>
@@ -561,22 +563,22 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
       }}
       labelledBy="strategy-settings-title"
       overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
-      panelClassName="w-[1200px] max-w-[95vw] max-h-[88vh] bg-surface/95 border border-border/50 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+      panelClassName="w-full max-w-[95vw] max-h-[88vh] bg-surface/95 border border-border/50 rounded-2xl shadow-2xl flex flex-col overflow-hidden sm:w-[1200px]"
     >
           {/* 标题 */}
-          <div className="flex items-center justify-between px-5 py-3 border-b border-border/50">
-            <div className="flex items-center gap-2.5">
-              <Settings2 className="h-4 w-4 text-accent" />
-              <span id="strategy-settings-title" className="text-sm font-semibold text-foreground">{detail?.name ?? strategyId}</span>
+          <div className="flex items-center justify-between gap-2 px-3 py-3 border-b border-border/50 sm:px-5">
+            <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+              <Settings2 className="h-4 w-4 shrink-0 text-accent" />
+              <span id="strategy-settings-title" className="min-w-0 truncate text-sm font-semibold text-foreground">{detail?.name ?? strategyId}</span>
               {detail && <span className="text-[10px] px-1.5 py-0.5 rounded bg-elevated text-muted">{{ custom: '自定义', ai: 'AI', composite: '叠加' }[detail.source] ?? detail.source}</span>}
-              <span className="text-[10px] text-muted/40 font-mono">{strategyId}</span>
+              <span className="hidden text-[10px] text-muted/40 font-mono sm:inline">{strategyId}</span>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               {detail && (
                 <StrategyExportButton strategyId={strategyId} disabled={dirtyAny || saving || resetting}
-                  disabledHint="请先保存修改，再导出策略包" className="h-7 w-7 border border-border/60 bg-surface" />
+                  disabledHint="请先保存修改，再导出策略包" className="h-9 w-9 border border-border/60 bg-surface sm:h-7 sm:w-7" />
               )}
-              <button aria-label="关闭" onClick={onClose} className="p-1.5 rounded-lg hover:bg-elevated transition-colors cursor-pointer"><X className="h-4 w-4 text-muted" /></button>
+              <button aria-label="关闭" onClick={onClose} className="inline-flex h-9 w-9 items-center justify-center rounded-lg hover:bg-elevated transition-colors cursor-pointer sm:h-auto sm:w-auto sm:p-1.5"><X className="h-4 w-4 text-muted" /></button>
             </div>
           </div>
 
@@ -584,29 +586,29 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
             <div className="flex flex-1 items-center justify-center py-16"><div className="w-6 h-6 border-2 border-accent/30 border-t-accent rounded-full animate-spin" /></div>
           ) : detail ? (
             <>
-              {/* 名称 + 描述 + 显示上限 */}
-              <div className="flex items-center gap-4 border-b border-border/40 px-5 py-2.5">
-                <div className="flex min-w-0 flex-[3] items-center gap-2">
+              {/* 名称 + 描述 + 显示上限 (窄屏堆叠, 避免三个 flex-[3]/[4] 压成一列文字) */}
+              <div className="flex flex-col gap-2 border-b border-border/40 px-3 py-2.5 sm:flex-row sm:items-center sm:gap-4 sm:px-5">
+                <div className="flex min-w-0 items-center gap-2 sm:flex-[3]">
                   <span className="shrink-0 text-[10px] uppercase tracking-wider text-muted/50">名称</span>
                   <input type="text" value={strategyName} onChange={e => setStrategyName(e.target.value)}
-                    className="h-8 min-w-0 flex-1 rounded-lg bg-base border-0 ring-1 ring-border/30 px-3 text-sm font-medium text-foreground focus:outline-none focus:ring-2 focus:ring-accent/30 transition-shadow" />
+                    className="h-9 min-w-0 flex-1 rounded-lg bg-base border-0 ring-1 ring-border/30 px-3 text-sm font-medium text-foreground focus:outline-none focus:ring-2 focus:ring-accent/30 transition-shadow sm:h-8" />
                 </div>
-                <div className="flex min-w-0 flex-[4] items-center gap-2">
+                <div className="flex min-w-0 items-center gap-2 sm:flex-[4]">
                   <span className="shrink-0 text-[10px] uppercase tracking-wider text-muted/50">描述</span>
                   <input type="text" value={strategyDesc} onChange={e => setStrategyDesc(e.target.value)}
-                    className="h-8 min-w-0 flex-1 rounded-lg bg-base border-0 ring-1 ring-border/30 px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent/30 transition-shadow" />
+                    className="h-9 min-w-0 flex-1 rounded-lg bg-base border-0 ring-1 ring-border/30 px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent/30 transition-shadow sm:h-8" />
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   <span className="text-[10px] text-muted/50">显示上限</span>
                   <input type="number" value={displayLimit ?? ''} onChange={e => setDisplayLimit(e.target.value ? Number(e.target.value) : null)} step={1} min={10} max={200} placeholder="不限"
-                    className="h-8 w-16 rounded-lg bg-base border border-border/40 px-1.5 text-xs font-mono text-foreground text-center focus:outline-none focus:border-accent/50" />
+                    className="h-9 w-20 rounded-lg bg-base border border-border/40 px-1.5 text-xs font-mono text-foreground text-center focus:outline-none focus:border-accent/50 sm:h-8 sm:w-16" />
                   <span className="text-[10px] text-muted/50">只</span>
                 </div>
               </div>
 
-              {/* 主区: 左侧分区导航 + 右侧内容页 */}
-              <div className="flex min-h-0 flex-1">
-                <nav className="flex w-44 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-border/40 px-2.5 py-3">
+              {/* 主区: 窄屏上下堆叠 (顶部横向 tab 条 + 内容), sm 以上恢复左导航 + 右内容 */}
+              <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
+                <nav className="flex w-full shrink-0 flex-row gap-0.5 overflow-x-auto border-b border-border/40 px-2 py-2 sm:w-44 sm:flex-col sm:overflow-y-auto sm:border-b-0 sm:border-r sm:px-2.5 sm:py-3">
                   {pages.map(p => {
                     const Icon = p.icon
                     const activePage = page === p.id
@@ -618,7 +620,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                         type="button"
                         aria-current={activePage ? 'page' : undefined}
                         onClick={() => setPage(p.id)}
-                        className={`flex h-9 items-center gap-2 rounded-lg border px-2.5 text-left transition-colors cursor-pointer ${
+                        className={`flex h-9 shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border px-2.5 text-left transition-colors cursor-pointer sm:w-full ${
                           activePage
                             ? 'border-accent/25 bg-accent/10 text-accent'
                             : 'border-transparent text-secondary hover:bg-elevated/60 hover:text-foreground'
@@ -631,8 +633,8 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       </button>
                     )
                   })}
-                  {/* 底部: 策略元信息 */}
-                  <div className="mt-auto space-y-1 border-t border-border/20 px-1 pt-3" hidden={pages.length === 0}>
+                  {/* 底部: 策略元信息 (窄屏隐藏, 无空间) */}
+                  <div className="mt-auto hidden space-y-1 border-t border-border/20 px-1 pt-3 sm:block" hidden={pages.length === 0}>
                     <div className="flex items-center justify-between text-[10px] text-muted/50">
                       <span>执行后端</span>
                       <span className="font-mono text-muted/70">{BACKEND_LABEL[detail.execution_backend] ?? detail.execution_backend}</span>
@@ -646,12 +648,12 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                   </div>
                 </nav>
 
-                <div className="min-w-0 flex-1 overflow-y-auto px-5 py-4">
+                <div className="min-w-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4">
                   {/* 策略条件: 基础参数 / 策略参数 / 叠加条件 */}
                   <div className={page === 'screen' ? PAGE_ANIM : 'hidden'}>
                     <div className="space-y-3">
                       <p className="text-[11px] leading-5 text-muted/70">决定哪些股票进入候选：基础过滤 → 策略参数 → 叠加条件，逐层收紧。</p>
-                      <div className="grid grid-cols-2 items-start gap-3">
+                      <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
                         <Card
                           icon={SlidersHorizontal}
                           title="基础参数"
@@ -664,7 +666,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                               onClick={() => setBasicFilterEnabled(v => !v)}
                               aria-pressed={basicFilterEnabled}
                               aria-label="启用基础参数过滤"
-                              className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors duration-200 cursor-pointer ${basicFilterEnabled ? 'bg-sky-500' : 'bg-elevated'}`}
+                              className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors duration-200 cursor-pointer before:absolute before:-inset-x-2.5 before:-inset-y-3 before:content-[''] ${basicFilterEnabled ? 'bg-sky-500' : 'bg-elevated'}`}
                             >
                               <span className={`inline-block h-3 w-3 rounded-full bg-white shadow-sm transition-transform duration-200 ${basicFilterEnabled ? 'translate-x-[14px]' : 'translate-x-0.5'}`} />
                             </button>
@@ -675,7 +677,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                             <RangeField label="流通市值" minVal={basicFilter.float_cap_min != null ? basicFilter.float_cap_min / 1e8 : null} maxVal={basicFilter.float_cap_max != null ? basicFilter.float_cap_max / 1e8 : null} onMinChange={v => setBF('float_cap_min', v != null ? v * 1e8 : null)} onMaxChange={v => setBF('float_cap_max', v != null ? v * 1e8 : null)} unit="亿" step="5" />
                             <RangeField label="成交额" minVal={basicFilter.amount_min != null ? basicFilter.amount_min / 1e8 : null} maxVal={basicFilter.amount_max != null ? basicFilter.amount_max / 1e8 : null} onMinChange={v => setBF('amount_min', v != null ? v * 1e8 : null)} onMaxChange={v => setBF('amount_max', v != null ? v * 1e8 : null)} unit="亿" step="0.5" />
                             <RangeField label="换手率" minVal={basicFilter.turnover_min} maxVal={basicFilter.turnover_max} onMinChange={v => setBF('turnover_min', v)} onMaxChange={v => setBF('turnover_max', v)} unit="%" step="0.5" />
-                            <div className="flex items-start gap-2 pt-0.5">
+                            <div className="flex flex-wrap items-start gap-2 pt-0.5 sm:flex-nowrap">
                               <span className={`${FIELD_LABEL_CLS} pt-0.5`}>板块</span>
                               <div className="flex flex-wrap gap-1">
                                 {ALL_BOARDS.map(b => {
@@ -683,15 +685,15 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                                   const active = boards.includes(b)
                                   return (
                                     <button key={b} onClick={() => { const cur: string[] = basicFilter.boards ?? ALL_BOARDS; const next = active ? cur.filter(x => x !== b) : [...cur, b]; setBF('boards', next.length === 0 ? ALL_BOARDS : next) }}
-                                      className={`px-2 py-1 rounded-md text-[11px] font-medium border transition-colors cursor-pointer ${active ? `${color.select.border} ${color.select.bgLight} ${color.select.text}` : `border-border bg-base text-muted ${color.select.borderHover}`}`}>{b}</button>
+                                      className={`inline-flex min-h-9 items-center justify-center rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors cursor-pointer sm:min-h-0 sm:px-2 ${active ? `${color.select.border} ${color.select.bgLight} ${color.select.text}` : `border-border bg-base text-muted ${color.select.borderHover}`}`}>{b}</button>
                                   )
                                 })}
                               </div>
                             </div>
-                            <div className="flex items-center gap-2">
+                            <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
                               <span className={FIELD_LABEL_CLS}>ST</span>
                               <button onClick={() => setBF('exclude_st', !basicFilter.exclude_st)}
-                                className={`px-2 py-1 rounded-md text-[11px] font-medium border transition-colors cursor-pointer ${basicFilter.exclude_st ? 'border-danger/40 bg-danger/10 text-danger' : 'border-border bg-base text-muted hover:border-danger/30'}`}>{basicFilter.exclude_st ? '排除' : '包含'}</button>
+                                className={`inline-flex min-h-9 items-center justify-center rounded-md border px-3 py-1 text-[11px] font-medium transition-colors cursor-pointer sm:min-h-0 sm:px-2 ${basicFilter.exclude_st ? 'border-danger/40 bg-danger/10 text-danger' : 'border-border bg-base text-muted hover:border-danger/30'}`}>{basicFilter.exclude_st ? '排除' : '包含'}</button>
                             </div>
                           </div>
                         </Card>
@@ -783,7 +785,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       <p className="text-[11px] leading-5 text-muted/70">控制买卖时点：出入场触发器对回测与监控生效（任一命中即触发）；策略扫描不消费触发器，仍按策略自身规则。风控与持仓纪律作为策略默认值保存，回测 / 优化 / 走查打开时自动继承。</p>
                       <Card icon={TrendingUp} title="风控与持仓纪律" accent="text-emerald-400">
                         <div className="space-y-2">
-                          <div className="grid grid-cols-2 gap-x-6 gap-y-2">
+                          <div className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
                             <RiskPctField label="止损" value={stopLoss} onChange={setStopLoss} min={0} max={99} />
                             <RiskPctField label="止盈" value={takeProfit} onChange={setTakeProfit} min={1} max={500} />
                             <RiskPctField label="移动止损" value={trailingStop} onChange={setTrailingStop} min={0.5} max={50} />
@@ -798,10 +800,10 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                               }}
                             />
                             <RiskPctField label="回撤止盈回撤" value={ttpDrawdown} onChange={setTtpDrawdown} min={0.5} max={50} unit="点" />
-                            <div className="flex items-center gap-2">
+                            <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
                               <span className={FIELD_LABEL_CLS}>最长持仓</span>
                               <input type="number" value={maxHoldDays ?? ''} onChange={e => setMaxHoldDays(e.target.value === '' ? null : Number(e.target.value))} step={1} min={1}
-                                className={`${FIELD_INPUT_CLS} w-[76px] px-2 text-center`} />
+                                className={`${FIELD_INPUT_CLS} w-[96px] px-2 text-center sm:w-[76px]`} />
                               <span className="text-[10px] text-muted">天{maxHoldDays == null && '（不限）'}</span>
                             </div>
                           </div>
@@ -809,12 +811,12 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                         </div>
                       </Card>
 
-                      <div className="grid grid-cols-2 items-start gap-3">
+                      <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
                         <Card
                           icon={TrendingUp}
                           title="入场触发器"
                           accent="text-accent"
-                          extra={<SignalTriggerActions kind="entry" signals={entrySignals} onChange={setEntrySignals} buttonClassName="rounded-md border border-border bg-base p-1 text-muted transition-colors cursor-pointer" iconClassName="h-3 w-3" />}
+                          extra={<SignalTriggerActions kind="entry" signals={entrySignals} onChange={setEntrySignals} buttonClassName="inline-flex min-h-9 min-w-9 items-center justify-center rounded-md border border-border bg-base p-1 text-muted transition-colors cursor-pointer sm:min-h-0 sm:min-w-0" iconClassName="h-3.5 w-3.5" />}
                         >
                           <div className="space-y-2">
                             <SignalPicker signals={entrySignals} onChange={setEntrySignals} kind="entry" options={{ variant: 'dialog' }} />
@@ -826,7 +828,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                           icon={TrendingUp}
                           title="出场触发器"
                           accent="text-warning"
-                          extra={<SignalTriggerActions kind="exit" signals={exitSignals} onChange={setExitSignals} buttonClassName="rounded-md border border-border bg-base p-1 text-muted transition-colors cursor-pointer" iconClassName="h-3 w-3" />}
+                          extra={<SignalTriggerActions kind="exit" signals={exitSignals} onChange={setExitSignals} buttonClassName="inline-flex min-h-9 min-w-9 items-center justify-center rounded-md border border-border bg-base p-1 text-muted transition-colors cursor-pointer sm:min-h-0 sm:min-w-0" iconClassName="h-3.5 w-3.5" />}
                         >
                           <div className="space-y-2">
                             <SignalPicker signals={exitSignals} onChange={setExitSignals} kind="exit" options={{ variant: 'dialog' }} />
@@ -851,10 +853,10 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       <div className="space-y-3">
                         <p className="text-[11px] leading-5 text-muted/70">叠加策略按权重融合子策略的结果；点击子策略名可单独编辑其配置。</p>
                         <div className="rounded-xl border border-teal-500/20 bg-teal-500/[0.03] overflow-hidden">
-                          <div className="flex items-center gap-2 border-b border-teal-500/15 bg-teal-500/[0.06] px-4 py-2.5">
+                          <div className="flex flex-wrap items-center gap-2 border-b border-teal-500/15 bg-teal-500/[0.06] px-3 py-2.5 sm:px-4">
                             <Layers className="h-3.5 w-3.5 text-teal-400" />
                             <span className="text-xs font-medium text-foreground/80">子策略与权重</span>
-                            <div className="ml-auto flex items-center gap-2">
+                            <div className="ml-auto flex flex-wrap items-center gap-2">
                               <span className="text-[10px] text-muted flex items-center gap-1.5">
                                 共 {compositeChildren.length} 个 · 权重
                                 <span className={`font-mono ${compositeChildren.length > 0 && compositeTotal !== 100 ? 'text-amber-400' : 'text-emerald-400'}`}>
@@ -864,12 +866,12 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                                   <span className="text-amber-400/60">(保存时自动按比例归一)</span>
                                 )}
                               </span>
-                              <button onClick={() => setShowAddChild(v => !v)} className="inline-flex items-center gap-1 h-6 px-2 rounded-lg border border-teal-500/30 bg-teal-500/10 text-[11px] text-teal-400 hover:bg-teal-500/20 cursor-pointer">
+                              <button onClick={() => setShowAddChild(v => !v)} className="inline-flex items-center gap-1 h-9 px-2 rounded-lg border border-teal-500/30 bg-teal-500/10 text-[11px] text-teal-400 hover:bg-teal-500/20 cursor-pointer sm:h-6">
                                 <Plus className="h-3 w-3" />添加
                               </button>
                             </div>
                           </div>
-                          <div className="space-y-3 px-4 py-3">
+                          <div className="space-y-3 px-3 py-3 sm:px-4">
                             {/* 添加子策略面板 */}
                             {showAddChild && (
                               <div className="rounded-lg border border-border bg-base/60 p-2 space-y-1 max-h-56 overflow-y-auto">
@@ -891,7 +893,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                             ) : (
                               <div className="space-y-1.5">
                                 {compositeChildren.map((c, i) => (
-                                  <div key={c.id} className="flex items-center gap-3 rounded-lg bg-base/60 px-3 py-2">
+                                  <div key={c.id} className="flex flex-wrap items-center gap-2 rounded-lg bg-base/60 px-3 py-2 sm:flex-nowrap sm:gap-3">
                                     <span className="w-5 shrink-0 font-mono text-[10px] text-muted/50">{i + 1}</span>
                                     <div className="min-w-0 flex-1">
                                       <div className="flex items-center gap-1.5">
@@ -917,7 +919,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                                         step={1}
                                         value={c.weight}
                                         onChange={e => setCompositeChildren(prev => prev.map((p, j) => j === i ? { ...p, weight: parseInt(e.target.value) || 0 } : p))}
-                                        className="h-1 w-36 cursor-pointer accent-teal-400"
+                                        className="h-1 w-24 cursor-pointer accent-teal-400 sm:w-36"
                                         aria-label={`${c.name || c.id}权重`}
                                       />
                                       <span className="w-9 text-right font-mono text-[10px] text-muted">{Math.round(c.weight)}%</span>
@@ -945,19 +947,19 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
             <div className="flex flex-1 items-center justify-center py-16 text-sm text-muted">加载失败</div>
           )}
 
-          {/* 底部按钮 */}
-          <div className="flex items-center justify-between border-t border-border/50 bg-surface/50 px-5 py-3">
+          {/* 底部按钮 (窄屏换行, 按钮 36px 触摸高度) */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/50 bg-surface/50 px-3 py-3 sm:px-5">
             <div className="flex items-center gap-2">
               <button onClick={handleReset} disabled={resetting}
-                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-border bg-surface text-xs text-secondary hover:text-danger hover:border-danger/30 transition-colors cursor-pointer disabled:opacity-50">
+                className="inline-flex items-center gap-1.5 h-9 px-3 rounded-lg border border-border bg-surface text-xs text-secondary hover:text-danger hover:border-danger/30 transition-colors cursor-pointer disabled:opacity-50 sm:h-8">
                 <RotateCcw className="h-3.5 w-3.5" />{resetting ? '重置中…' : '重置默认'}
               </button>
               {(detail?.source === 'ai' || detail?.source === 'custom' || detail?.source === 'composite') && (
                 <button onClick={() => { setDeleteError(''); setShowDeleteConfirm(true) }}
-                  className="text-[10px] text-danger hover:text-danger/80 transition-colors">删除策略</button>
+                  className="inline-flex h-9 items-center px-2 text-[10px] text-danger hover:text-danger/80 transition-colors cursor-pointer sm:h-8">删除策略</button>
               )}
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {dirtyAny && (
                 <span className="mr-1 inline-flex items-center gap-1.5 text-[11px] text-amber-400/90" title="改动需点击「保存设置」后生效">
                   <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />有未保存的改动
@@ -965,12 +967,12 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
               )}
               {onAiModify && (detail?.source === 'ai' || detail?.source === 'custom') && (
                 <button onClick={onAiModify}
-                  className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-amber-400/30 bg-amber-400/8 text-amber-400 text-xs font-medium hover:bg-amber-400/15 transition-colors cursor-pointer">
+                  className="inline-flex items-center gap-1.5 h-9 px-3 rounded-lg border border-amber-400/30 bg-amber-400/8 text-amber-400 text-xs font-medium hover:bg-amber-400/15 transition-colors cursor-pointer sm:h-8">
                   <Sparkles className="h-3.5 w-3.5" />AI 修改
                 </button>
               )}
               <button onClick={handleSave} disabled={saving}
-                className="inline-flex items-center gap-1.5 h-8 px-4 rounded-lg bg-accent text-white text-xs font-semibold hover:bg-accent/90 transition-colors cursor-pointer disabled:opacity-50">
+                className="inline-flex items-center gap-1.5 h-9 px-4 rounded-lg bg-accent text-white text-xs font-semibold hover:bg-accent/90 transition-colors cursor-pointer disabled:opacity-50 sm:h-8">
                 <Save className="h-3.5 w-3.5" />{saving ? '保存中…' : '保存设置'}
               </button>
             </div>
@@ -988,7 +990,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
-            className="w-[380px] bg-surface border border-border/50 rounded-2xl shadow-2xl p-6"
+            className="w-[calc(100vw-2rem)] max-w-[380px] bg-surface border border-border/50 rounded-2xl shadow-2xl p-5 sm:w-[380px] sm:p-6"
             onClick={e => e.stopPropagation()}
           >
             <div className="text-center space-y-3">

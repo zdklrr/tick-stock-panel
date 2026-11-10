@@ -260,7 +260,7 @@ export function ScoringEditor({ value, directions, onChange, fallbackLabels = {}
           <button
             type="button"
             onClick={editing ? saveDraft : startEditing}
-            className="inline-flex h-7 items-center gap-1.5 rounded-btn border border-amber-400/40 bg-amber-400/10 px-2.5 text-[11px] text-amber-400 transition-colors hover:bg-amber-400/15"
+            className="inline-flex h-9 items-center gap-1.5 rounded-btn border border-amber-400/40 bg-amber-400/10 px-2.5 text-[11px] text-amber-400 transition-colors hover:bg-amber-400/15 sm:h-7"
           >
             {editing ? <Save className="h-3.5 w-3.5" /> : <Pencil className="h-3.5 w-3.5" />}
             {editing ? '保存方案' : '编辑方案'}

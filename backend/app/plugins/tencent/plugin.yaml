@@ -1,0 +1,17 @@
+name: tencent
+display_name: "腾讯行情 (免费)"
+runtime: none
+entry: app.plugins.tencent.provider:TencentProvider
+check: app.plugins.tencent.provider:availability
+datasets:
+  - realtime
+  - depth5
+description: "免费、无需 Key 的腾讯行情源(qt.gtimg.cn 批量快照), 覆盖沪深京股票 + ETF + 指数; 五档盘口与实时快照同一次请求返回。"
+usage_notes:
+  - "免费、无需申请 Key, 开箱即用; 不消耗积分。"
+  - "批量快照单次建议 50~100 只(实测 100 只约 0.04s), 插件内部按 80 只/批 + 50ms 批间隔限速。"
+  - "全市场标的池来自本地维表(个股 + ETF)与自选, 维表缺失时仅剩自选, 宁缺毋假。"
+  - "返回行数可能少于请求数(停牌/退市/代码不存在时服务端不返回该行), 缺失标的直接跳过, 不重试。"
+  - "五档盘口复用同一快照, 不额外请求; 价格为 0 的档位剔除, 买/卖任一为空时不提供该标的盘口。"
+  - "实时行情软失败(返回空列表)不阻断轮询; 指数快照失败保留上一轮缓存。"
+homepage: https://gu.qq.com/

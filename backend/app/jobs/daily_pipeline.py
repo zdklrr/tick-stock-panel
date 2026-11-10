@@ -23,7 +23,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app.config import settings
 from app.indicators.pipeline import filter_halt_days, run_pipeline
 from app.market_time import cn_today
-from app.services import index_sync, instrument_sync, kline_sync
+from app.services import index_sync, instrument_sync, kline_sync, market_context_refresh
 from app.services import preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import get_pool
@@ -538,6 +538,64 @@ def run_now(
     # 均线/动量/量比等指标暖机不足, 管道各 stage 都"成功"但策略会静默全 0。
     enriched_total_days = warn_if_enriched_too_thin(repo.store.data_dir)
 
+    # Step 2.2: 市场环境(regime) 增量计算 — enriched 已就绪后聚合环境指标。
+    # 双检测(缺口+stale), 自动补算遗漏/被覆写的日。软失败: 不阻断主管道。
+    # 默认关闭: regime 是本地聚合计算(非拉取), 首次/regime 表为空时需全量回填
+    # 多日, 内存与耗时较高。用户可在数据页「市场环境」卡片设置里开启自动计算,
+    # 或直接在该页面点「重算」手动触发(不受此开关影响)。
+    # 位置说明: 2026-11 NAS 事故后从 sync_index 之后前移到这里 — sync_index
+    # 里 ETF adj_factor 失败/持锁不应挡住情绪周期数据更新; 先把不依赖指数/ETF
+    # 的本地聚合阶段跑完, 再进入可能被数据源权限拖垮的同步阶段。
+    regime_days = 0
+    from app.services import preferences as _prefs_regime
+    if not _prefs_regime.get_pipeline_regime_enabled():
+        skipped.append("regime")
+        logger.info("compute_regime skipped: user disabled (pipeline_regime_enabled=False)")
+    else:
+        try:
+            emit("compute_regime", 88, "计算市场环境…")
+            from app.api.regime import invalidate_regime_cache
+            from app.services import regime_builder
+            new_regime = regime_builder.compute_regime_incremental(repo, repo.store.data_dir)
+            regime_days = new_regime.height if not new_regime.is_empty() else 0
+            if regime_days:
+                invalidate_regime_cache()
+                logger.info("compute_regime: %d days", regime_days)
+            emit("compute_regime", 89, f"市场环境 {regime_days} 天")
+            # 阶段切换推送监控通知 (软失败, 不影响管道): 末两日阶段不同 = 今日发生切换。
+            # 切入退潮/冰点为风险信号, 用 warn 级别; 其余 info。
+            if regime_days:
+                try:
+                    _push_phase_change_alert(repo.store.data_dir)
+                except Exception as e:
+                    logger.warning("phase change alert failed (soft): %s", e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("compute_regime failed (soft): %s", e)
+            stage_errors.append(f"compute_regime: {e}")
+            skipped.append("regime")
+
+    # Step 2.3(前移): 市场主线(概念/行业涨停梯队聚合) 增量计算 — regime 同开关。
+    # 只窄扫连板 >=1 的行, 增量通常 1 天, 开销可忽略。软失败: 不阻断主管道。
+    mainline_rows = 0
+    if not _prefs_regime.get_pipeline_regime_enabled():
+        skipped.append("mainline")
+    else:
+        try:
+            emit("compute_mainline", 89, "计算市场主线…")
+            from app.services import market_mainline
+            for _kind in ("concept", "industry"):
+                rows = market_mainline.compute_mainline_incremental(
+                    repo, repo.store.data_dir, kind=_kind
+                )
+                mainline_rows += rows.height if not rows.is_empty() else 0
+            if mainline_rows:
+                logger.info("compute_mainline: %d rows", mainline_rows)
+            emit("compute_mainline", 90, f"市场主线 {mainline_rows} 行")
+        except Exception as e:
+            logger.warning("compute_mainline failed (soft): %s", e)
+            stage_errors.append(f"compute_mainline: {e}")
+            skipped.append("mainline")
+
     # Step 2.3: 指数 / ETF 同步 — 物理分开存储；ETF 可复权，指数不复权。
     written_index_daily = 0
     written_etf_daily = 0
@@ -703,60 +761,8 @@ def run_now(
         else:
             logger.info("sync_minute skipped: user disabled")
 
-    # Step 2.6: 市场环境(regime) 增量计算 — enriched 已就绪后聚合环境指标。
-    # 双检测(缺口+stale), 自动补算遗漏/被覆写的日。软失败: 不阻断主管道。
-    # 默认关闭: regime 是本地聚合计算(非拉取), 首次/regime 表为空时需全量回填
-    # 多日, 内存与耗时较高。用户可在数据页「市场环境」卡片设置里开启自动计算,
-    # 或直接在该页面点「重算」手动触发(不受此开关影响)。
-    regime_days = 0
-    from app.services import preferences as _prefs_regime
-    if not _prefs_regime.get_pipeline_regime_enabled():
-        skipped.append("regime")
-        logger.info("compute_regime skipped: user disabled (pipeline_regime_enabled=False)")
-    else:
-        try:
-            emit("compute_regime", 90, "计算市场环境…")
-            from app.api.regime import invalidate_regime_cache
-            from app.services import regime_builder
-            new_regime = regime_builder.compute_regime_incremental(repo, repo.store.data_dir)
-            regime_days = new_regime.height if not new_regime.is_empty() else 0
-            if regime_days:
-                invalidate_regime_cache()
-                logger.info("compute_regime: %d days", regime_days)
-            emit("compute_regime", 92, f"市场环境 {regime_days} 天")
-            # 阶段切换推送监控通知 (软失败, 不影响管道): 末两日阶段不同 = 今日发生切换。
-            # 切入退潮/冰点为风险信号, 用 warn 级别; 其余 info。
-            if regime_days:
-                try:
-                    _push_phase_change_alert(repo.store.data_dir)
-                except Exception as e:
-                    logger.warning("phase change alert failed (soft): %s", e)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("compute_regime failed (soft): %s", e)
-            stage_errors.append(f"compute_regime: {e}")
-            skipped.append("regime")
-
-    # Step 2.7: 市场主线(概念/行业涨停梯队聚合) 增量计算 — regime 同开关。
-    # 只窄扫连板 >=1 的行, 增量通常 1 天, 开销可忽略。软失败: 不阻断主管道。
-    mainline_rows = 0
-    if not _prefs_regime.get_pipeline_regime_enabled():
-        skipped.append("mainline")
-    else:
-        try:
-            emit("compute_mainline", 93, "计算市场主线…")
-            from app.services import market_mainline
-            for _kind in ("concept", "industry"):
-                rows = market_mainline.compute_mainline_incremental(
-                    repo, repo.store.data_dir, kind=_kind
-                )
-                mainline_rows += rows.height if not rows.is_empty() else 0
-            if mainline_rows:
-                logger.info("compute_mainline: %d rows", mainline_rows)
-            emit("compute_mainline", 94, f"市场主线 {mainline_rows} 行")
-        except Exception as e:
-            logger.warning("compute_mainline failed (soft): %s", e)
-            stage_errors.append(f"compute_mainline: {e}")
-            skipped.append("mainline")
+    # (regime / mainline 阶段已前移至 compute_enriched 之后、sync_index 之前 —
+    #  避免指数/ETF 同步失败或持锁挡住情绪周期与主线数据更新。)
 
     # Step 2.8: 模拟盘结算: 顺延单按当日开盘/收盘撮合 → 除权调整 → 定版净值。
     # 幂等: 重跑同日不会重复成交/二次除权 (订单状态与 corp_action 台账守卫)。
@@ -796,6 +802,16 @@ def run_now(
     except Exception as e:
         logger.warning("paper_settle failed (soft): %s", e)
         stage_errors.append(f"paper_settle: {e}")
+
+    # Step 2.9: 风险提示补推 — 盘后 regime / 模拟盘净值都已就位, 此时外围风险、
+    # 盘前简报、大盘状态换档的判断才有完整依据 (盘中轮询已停)。软失败不影响管道。
+    if _prefs_regime.get_pipeline_regime_enabled():
+        try:
+            emit("risk_alert", 94, "生成风险提示…")
+            _push_risk_alert(repo.store.data_dir)
+            emit("risk_alert", 95, "风险提示完成")
+        except Exception as e:  # noqa: BLE001 — 提示失败绝不影响管道结果
+            logger.warning("risk alert failed (soft): %s", e)
 
     # Step 3: 刷新视图
     emit("refresh_views", 95, "刷新 DuckDB 视图…")
@@ -1027,6 +1043,24 @@ def _push_phase_change_alert(data_dir) -> None:
             "severity": severity,
         }])
     logger.info("phase change alert: %s (severity=%s)", msg, severity)
+
+
+def _push_risk_alert(data_dir) -> None:
+    """盘后补一次风险提示: 外围风险雷达 / 盘前简报 / 大盘状态换档。
+
+    盘中由 quote_service 轮询线程调 risk_alert.schedule 节流推送; 但盘后管道跑完
+    regime 之后大盘状态会是新值, 而轮询已停 —— 这里补一次, 保证「收盘后的状态
+    变化」也能提示到人。risk_alert 自己的去重与节流会挡住重复播报。
+    """
+    try:
+        from app.services import risk_alert
+
+        app_state = _get_app_state()
+        qs = getattr(app_state, "quote_service", None) if app_state else None
+        events = risk_alert.run_tick(data_dir, qs)
+        logger.info("risk alert after pipeline: %d 条", len(events))
+    except Exception as e:  # noqa: BLE001 — 提示失败绝不影响管道结果
+        logger.warning("risk alert failed (soft): %s", e)
 
 
 def _run_tracked(fn, job_label: str) -> bool:
@@ -1444,10 +1478,43 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         logger.info("scheduled_review enabled @%02d:%02d mon-fri",
                     review_sched["hour"], review_sched["minute"])
 
+    # 盘前: 把大盘择时/情绪周期/风险雷达刷到最新 (v0.3.41)。
+    # 用户要求「这些数据应该在每天开盘前就取到, 基本上 9:25 竞价结束就该是最新,
+    # 这是最迟」。桌面端默认不跑盘后管道、笔记本晚上关机, 光靠惰性自愈会在
+    # 首屏先给旧数字 —— 这里在竞价结束前主动补一次, 保证 09:25 打开页面即是当天。
+    def _premarket_context_task():
+        from app.services.market_context_refresh import refresh_market_context
+
+        app_state = _get_app_state()
+        data_dir = getattr(getattr(app_state, "repo", None), "store", None)
+        data_dir = getattr(data_dir, "data_dir", None)
+        result = refresh_market_context(data_dir)
+        if not result.get("ok"):
+            logger.warning("盘前刷新有软失败: %s", result.get("errors"))
+        else:
+            logger.info("盘前刷新完成: %s", result)
+        return result
+
+    premarket_at = market_context_refresh.PREMARKET_REFRESH_AT
+    scheduler.add_job(
+        _premarket_context_task,
+        trigger=CronTrigger(day_of_week="mon-fri",
+                            hour=premarket_at.hour, minute=premarket_at.minute,
+                            timezone="Asia/Shanghai"),
+        id="premarket_context_refresh",
+        misfire_grace_time=1800,
+        replace_existing=True,
+    )
+
     scheduler.start()
-    logger.info("scheduler started; instruments@%02d:%02d, pipeline@%02d:%02d, depth@%02d:%02d mon-fri",
-                inst_sched["hour"], inst_sched["minute"], sched["hour"], sched["minute"],
-                depth_sched["hour"], depth_sched["minute"])
+    logger.info(
+        "scheduler started; instruments@%02d:%02d, premarket@%02d:%02d, "
+        "pipeline@%02d:%02d, depth@%02d:%02d mon-fri",
+        inst_sched["hour"], inst_sched["minute"],
+        premarket_at.hour, premarket_at.minute,
+        sched["hour"], sched["minute"],
+        depth_sched["hour"], depth_sched["minute"],
+    )
     return scheduler
 
 

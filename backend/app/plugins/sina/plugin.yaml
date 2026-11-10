@@ -1,0 +1,18 @@
+# 新浪行情 — 免费 HTTP 行情接口 (quotes.sina.cn), 无需 Key、无第三方依赖。
+# runtime: none → 不需要 install 步骤; 免费源故不声明 api_key_env。
+# 只声明真实提供的两项能力, 其余数据集 provider_has_dataset 为 False → 回退 TickFlow。
+
+name: sina
+display_name: "新浪行情 (免费)"
+runtime: none
+entry: app.plugins.sina.provider:SinaProvider
+check: app.plugins.sina.provider:availability
+datasets: [minute, full_minute]
+description: "新浪行情免费接口(无需 Key、零依赖): 提供 1 分钟K(含成交额, 原始不复权价)与全量分钟两项能力; 未接入日K/实时/五档/财务, 自动回退 TickFlow。"
+usage_notes:
+  - "分钟K: 1m 逐标的拉取, 238 根/交易日; 历史深度实测 datalen=1023 覆盖 4 个完整交易日 + 第 5 日部分(最早一日仅 71 根), 故声明 minute_history_days=4, 前端分时档位据此收窄"
+  - "全量分钟: 上游无批量端点, 逐标的拉取; 实测 30 只串行均摊 146 毫秒/只(含 0.08 秒节流), 外推全市场约 5500 只一轮约 13-14 分钟"
+  - "未实现 get_intraday_latest(新浪无全市场批量分钟端点) → 全量分钟自动降级为仅修复轮, 盘中节奏下限抬到 60 秒"
+  - "成交量上游单位为股, 已按 100 股=1 手向下取整折算; 成交额单位元原样透传; 价格为原始不复权价"
+  - "个股/ETF/指数三类标的均支持(上游同布局): 实测 510300.SH、000001.SH 分钟量合计 ÷100 与同日日K 手数一致; 指数每日 239 根(尾部多一根独立 14:58), 个股与 ETF 为 238 根"
+homepage: "https://finance.sina.com.cn/stock/"

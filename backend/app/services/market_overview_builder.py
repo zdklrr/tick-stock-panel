@@ -470,12 +470,17 @@ def build_market_overview(
     strong_up = sum(1 for v in pct_values if v >= 0.03)
     strong_down = sum(1 for v in pct_values if v <= -0.03)
 
-    limit_up = sum(1 for r in rows if bool(r.get("signal_limit_up")) or (_finite(r.get("consecutive_limit_ups")) or 0) > 0)
+    limit_up_rows = [r for r in rows if bool(r.get("signal_limit_up")) or (_finite(r.get("consecutive_limit_ups")) or 0) > 0]
+    limit_up = len(limit_up_rows)
     broken = sum(1 for r in rows if bool(r.get("signal_broken_limit_up")))
-    limit_down = sum(1 for r in rows if bool(r.get("signal_limit_down")))
+    limit_down_rows = [r for r in rows if bool(r.get("signal_limit_down"))]
+    limit_down = len(limit_down_rows)
     max_boards = max([int(_finite(r.get("consecutive_limit_ups")) or 0) for r in rows], default=0)
 
     # 五档 sealed 修正: 假涨停/假跌停不计入(需 Pro+ depth5.batch 能力)
+    # 只修正**当前确实被判为涨跌停**的标的: depth5 快照可能来自更早的判定口径
+    # (如维表 limit_up 陈旧导致的历史误判), 若不做交集, 已在修复后不再是涨停
+    # 的标的会被重复扣减, 把涨停家数越修越小。
     sealed_ready = False
     fake_up = 0
     fake_down = 0
@@ -484,9 +489,17 @@ def build_market_overview(
         down_map = depth_service.get_sealed_map(as_of, is_down=True)
         sealed_ready = bool(up_map or down_map) and depth_service.is_sealed_ready(as_of)
         if up_map:
-            fake_up = sum(1 for v in up_map.values() if v.get("sealed") is False)
+            _up_syms = {str(r.get("symbol")) for r in limit_up_rows if r.get("symbol")}
+            fake_up = sum(
+                1 for sym, v in up_map.items()
+                if v.get("sealed") is False and str(sym) in _up_syms
+            )
         if down_map:
-            fake_down = sum(1 for v in down_map.values() if v.get("sealed") is False)
+            _down_syms = {str(r.get("symbol")) for r in limit_down_rows if r.get("symbol")}
+            fake_down = sum(
+                1 for sym, v in down_map.items()
+                if v.get("sealed") is False and str(sym) in _down_syms
+            )
     if sealed_ready:
         limit_up = max(0, limit_up - fake_up)
         limit_down = max(0, limit_down - fake_down)

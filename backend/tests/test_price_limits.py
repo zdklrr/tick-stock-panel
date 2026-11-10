@@ -321,6 +321,94 @@ def test_daily_limit_prices_ignore_zero_placeholder_and_match_realtime():
     assert mild["consecutive_limit_ups"][-1] == realtime["consecutive_limit_ups"][0]
 
 
+def test_stale_instrument_limit_price_falls_back_to_theoretical():
+    """v0.3.37: 维表涨跌停价是「更早某个交易日」的快照时不得采信。
+
+    instruments.limit_up / limit_down 由数据源按某个交易日收盘算出, 而维表
+    as_of 是落盘时统一打的当日日期 —— 数据源滞后时两者不一致。NAS 实测
+    (2026-11-04): 维表 limit_up 与 11-02 收盘算出的涨停价 5211/5216 = 99.9%
+    相符, 与 11-04 当日只有 6.4% 相符, 导致 88 只真涨停漏判 + 16 只误判,
+    看板显示 34 家而真实 123 家。
+
+    本用例三天收盘 10.00 / 分化 / 当日:
+      - 600001 昨收 9.00  → 真涨停价 9.90, 收 9.90 是涨停 (旧价 11.00 判不出)
+      - 600002 昨收 10.50 → 真涨停价 11.55, 收 11.00 不是涨停 (旧价会误判)
+      - 600003 昨收 10.00 → 真涨停价 11.00 与旧价相同, 不误伤
+    """
+    d1, d2, d3, d4 = (date(2026, 10, 29), date(2026, 10, 30),
+                      date(2026, 11, 2), date(2026, 11, 3))
+    closes = {
+        "600001.SH": [10.0, 10.0, 9.0, 9.9],
+        "600002.SH": [10.0, 10.0, 10.5, 11.0],
+        "600003.SH": [10.0, 10.0, 10.0, 11.0],
+    }
+    rows = [
+        {
+            "symbol": sym, "date": d,
+            "open": c, "high": c, "low": c,
+            "close": c, "raw_close": c, "raw_high": c,
+            "volume": 1000.0, "amount": 10000.0,
+        }
+        for sym, series in closes.items()
+        for d, c in zip([d1, d2, d3, d4], series, strict=True)
+    ]
+    instruments = pl.DataFrame({
+        "symbol": list(closes),
+        "name": ["A", "B", "C"],
+        "float_shares": [1e9] * 3,
+        "limit_up": [11.0] * 3,       # 三天前收盘 10.00 x 1.1 的快照
+        "limit_down": [9.0] * 3,
+        "listing_date": [date(2010, 1, 1)] * 3,
+        "as_of": [d4] * 3,            # 谎报成当日, 正是事故形态
+    })
+
+    result = pipeline.compute_limit_signals(
+        pl.DataFrame(rows), instruments,
+        needed={"signal_limit_up", "consecutive_limit_ups"},
+    )
+    last = result.filter(pl.col("date") == d4).sort("symbol")
+
+    expect_price = {
+        "600001.SH": round(9.0 * 1.1, 2),    # 9.90
+        "600002.SH": round(10.5 * 1.1, 2),   # 11.55
+        "600003.SH": round(10.0 * 1.1, 2),   # 11.00
+    }
+    expect_up = {"600001.SH": True, "600002.SH": False, "600003.SH": True}
+
+    for row in last.iter_rows(named=True):
+        sym = row["symbol"]
+        assert abs(row["limit_up_price"] - expect_price[sym]) <= 0.02, (
+            f"{sym} 仍在采信陈旧维表价 (limit_up_price={row['limit_up_price']}, "
+            f"应为理论价 {expect_price[sym]})"
+        )
+    assert last["signal_limit_up"].to_list() == [expect_up[s] for s in last["symbol"].to_list()]
+
+
+def test_fresh_instrument_limit_price_is_still_trusted():
+    """当日权威价与理论价一致时照旧采信, 不能被陈旧快照守卫误伤。"""
+    d1, d2 = date(2026, 11, 2), date(2026, 11, 3)
+    rows = [
+        {"symbol": "600001.SH", "date": d1, "open": 10.0, "high": 10.0,
+         "low": 10.0, "close": 10.0, "raw_close": 10.0, "raw_high": 10.0,
+         "volume": 1000.0, "amount": 10000.0},
+        {"symbol": "600001.SH", "date": d2, "open": 11.0, "high": 11.0,
+         "low": 11.0, "close": 11.0, "raw_close": 11.0, "raw_high": 11.0,
+         "volume": 1000.0, "amount": 10000.0},
+    ]
+    instruments = pl.DataFrame({
+        "symbol": ["600001.SH"], "name": ["普通股"],
+        "float_shares": [1e9],
+        "limit_up": [11.0], "limit_down": [9.0],
+        "listing_date": [date(2010, 1, 1)], "as_of": [d2],
+    })
+    result = pipeline.compute_limit_signals(
+        pl.DataFrame(rows), instruments,
+        needed={"signal_limit_up", "consecutive_limit_ups"},
+    )
+    assert result["signal_limit_up"][-1] is True
+    assert result["consecutive_limit_ups"][-1] == 1
+
+
 def test_realtime_limit_prices_ignore_stale_instrument_date():
     today = date(2026, 7, 20)
     rows = pl.DataFrame({

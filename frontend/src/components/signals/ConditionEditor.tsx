@@ -72,7 +72,7 @@ export function ConditionEditor({ conditions, onChange, options, max = 8, title,
             <button
               onClick={addCond}
               disabled={conditions.length >= max}
-              className="inline-flex items-center gap-1 text-[11px] text-accent hover:text-accent/80 cursor-pointer disabled:opacity-40"
+              className="inline-flex min-h-9 items-center gap-1 text-[11px] text-accent hover:text-accent/80 cursor-pointer disabled:opacity-40 sm:min-h-0"
             >
               <Plus className="h-3 w-3" />添加条件
             </button>

@@ -5,6 +5,8 @@
  * - 类型安全，不再散落 try/catch。
  */
 
+import { useCallback, useSyncExternalStore } from 'react'
+
 function kv<T>(key: string) {
   return {
     get(fallback: T): T {
@@ -188,4 +190,96 @@ export const storage = {
   dataCardVisible: kv<Record<string, boolean>>('data-card-visible'),
   /** 数据页画像卡片顺序 (卡片key 数组, 长度=卡片总数) */
   dataCardOrder: kv<string[]>('data-card-order'),
+
+  /** 监控中心噪音过滤偏好 (隐藏模拟盘自动跟单 / 成交的实时提示) */
+  monitorNoise: kv<MonitorNoisePref>('monitor-noise'),
 } as const
+
+// ── 监控中心噪音过滤 ────────────────────────────────────
+// 模拟盘自动跟单每秒都可能下单, 触发记录/弹窗/语音被刷屏, 多数用户只关心策略与
+// 规则监控。偏好集中在 storage.monitorNoise, 监控中心页头、看板小组件、全局
+// AlertToast 三处共用同一份设置 (一处改动三处生效)。
+
+/** 是否隐藏某类模拟盘噪音事件 */
+export interface MonitorNoisePref {
+  /** 隐藏「自动跟单」下单事件 (source=paper, type=auto_order) */
+  hideAutoOrder: boolean
+  /** 隐藏「模拟盘成交」事件 (source=paper, type=fill/paper_fill) */
+  hideFill: boolean
+}
+
+/** 默认只隐藏自动跟单: 刷屏最厉害的一类; 成交记录默认保留, 多数用户想看成交 */
+export const MONITOR_NOISE_DEFAULT: MonitorNoisePref = { hideAutoOrder: true, hideFill: false }
+
+/** 读取噪音过滤偏好 (字段缺失/脏数据回退默认; 无 localStorage 环境安全降级) */
+export function readMonitorNoise(): MonitorNoisePref {
+  const raw = storage.monitorNoise.get(MONITOR_NOISE_DEFAULT)
+  if (!raw || typeof raw !== 'object') return { ...MONITOR_NOISE_DEFAULT }
+  return {
+    hideAutoOrder: typeof raw.hideAutoOrder === 'boolean' ? raw.hideAutoOrder : MONITOR_NOISE_DEFAULT.hideAutoOrder,
+    hideFill: typeof raw.hideFill === 'boolean' ? raw.hideFill : MONITOR_NOISE_DEFAULT.hideFill,
+  }
+}
+
+// 订阅机制: 监控中心页头开关 / 看板小组件 / 弹窗三处共用同一份偏好,
+// 任何一处改动立即同步到其余两处 (无需刷新页面)。
+const _noiseListeners = new Set<() => void>()
+// useSyncExternalStore 要求 snapshot 引用稳定, 否则会无限重渲染 → 缓存到下次写入
+let _noiseCache: MonitorNoisePref | null = null
+
+function notifyNoise() {
+  _noiseCache = null
+  _noiseListeners.forEach(fn => fn())
+}
+
+/** 订阅偏好变化, 返回取消函数 */
+export function subscribeMonitorNoise(fn: () => void): () => void {
+  _noiseListeners.add(fn)
+  return () => { _noiseListeners.delete(fn) }
+}
+
+/** 稳定的快照引用 (无变化时 === 上次返回值) */
+export function getMonitorNoiseSnapshot(): MonitorNoisePref {
+  if (_noiseCache === null) _noiseCache = readMonitorNoise()
+  return _noiseCache
+}
+
+/** 写入噪音过滤偏好 (跨刷新生效, 并通知已挂载的组件) */
+export function writeMonitorNoise(pref: MonitorNoisePref): void {
+  storage.monitorNoise.set({ hideAutoOrder: !!pref.hideAutoOrder, hideFill: !!pref.hideFill })
+  notifyNoise()
+}
+
+/**
+ * 事件是否属于被隐藏的噪音 (只作用于 source=paper, 策略/信号等来源永不隐藏)。
+ * 纯函数, 便于单测与三处调用方共用。
+ */
+export function isNoiseAlert(
+  ev: { source?: string | null; type?: string | null },
+  pref: MonitorNoisePref,
+): boolean {
+  if (ev.source !== 'paper') return false
+  if (pref.hideAutoOrder && ev.type === 'auto_order') return true
+  if (pref.hideFill && (ev.type === 'fill' || ev.type === 'paper_fill')) return true
+  return false
+}
+
+/** 按当前偏好过滤事件数组 (纯函数; 过滤条数用于页头「已隐藏 N 条」小字) */
+export function filterNoiseAlerts<T extends { source?: string | null; type?: string | null }>(
+  events: T[],
+  pref: MonitorNoisePref,
+): T[] {
+  return events.filter(ev => !isNoiseAlert(ev, pref))
+}
+
+/**
+ * 订阅噪音过滤偏好的 React hook (监控中心页头开关 / 看板小组件 / 弹窗共用)。
+ * 无 localStorage 环境 (SSR) 回退默认值。
+ */
+export function useMonitorNoise(): [MonitorNoisePref, (next: Partial<MonitorNoisePref>) => void] {
+  const pref = useSyncExternalStore(subscribeMonitorNoise, getMonitorNoiseSnapshot, () => MONITOR_NOISE_DEFAULT)
+  const update = useCallback((next: Partial<MonitorNoisePref>) => {
+    writeMonitorNoise({ ...getMonitorNoiseSnapshot(), ...next })
+  }, [])
+  return [pref, update]
+}

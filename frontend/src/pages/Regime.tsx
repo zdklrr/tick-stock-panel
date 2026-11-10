@@ -23,6 +23,9 @@ import { QK } from '@/lib/queryKeys'
 import { useChartTheme, useTheme } from '@/lib/theme'
 import { toast } from '@/components/Toast'
 import { Modal } from '@/components/Modal'
+import { GlobalRiskCard } from '@/components/regime/GlobalRiskCard'
+import { MarketTimingCard } from '@/components/regime/MarketTimingCard'
+import { PremarketCard } from '@/components/regime/PremarketCard'
 import { cn } from '@/lib/cn'
 import './Regime.css'
 
@@ -801,6 +804,9 @@ export function Regime() {
         </div>
       )}
 
+      {/* ── 盘前简报: A50/美股/亚太 → 开盘方向 + 缺口 + 三段概率 (接口未就绪时卡内自显降级态) ── */}
+      <PremarketCard />
+
       {/* ── 阶段规律: 当前阶段的历史统计 + 下阶段转移分布 (窗口内 segments 提炼) ── */}
       {phaseStats && phaseStreak && (
         <div className={cn(cardCls, 'regime-phase-patterns')}>
@@ -892,6 +898,12 @@ export function Regime() {
           </div>
         </div>
       )}
+
+      {/* ── 大盘择时: 沪深300 收盘 vs MA20/MA60 → 趋势四态 + 三路合成的建议仓位 ── */}
+      <MarketTimingCard />
+
+      {/* ── 风险雷达: 外围 7 指数 + A股宽度 + 账户回撤 → 仓位系数 ── */}
+      <GlobalRiskCard />
 
       {/* ── 阶段 × 主线 (什么阶段走什么主升) ── */}
       {segments.length > 0 && (

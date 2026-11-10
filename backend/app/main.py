@@ -41,6 +41,7 @@ from app.api import (
     pipeline,
     position_policies,
     regime,
+    risk,
     rps,
     screener,
     sector_rotation,
@@ -168,7 +169,7 @@ async def _application_lifespan(app: FastAPI):
             logger.warning("enriched generation requires a full rebuild: %s", exc)
     # 指标异步预热标志: enriched 缓存在后台线程构建, 完成后置 True
     app.state.indicators_ready = False
-    repo._on_warmup_done = lambda: setattr(app.state, "indicators_ready", True)  # noqa: SLF001
+    repo._on_warmup_done = lambda: setattr(app.state, "indicators_ready", True)
 
     # Polars 缓存预热 — enriched 的重计算 (107万行 compute_indicators) 推后台,
     # instruments/index/ETF 仍同步 (毫秒级)。应用立即 ready, 指标算完后自动替换。
@@ -249,6 +250,52 @@ async def _application_lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.warning("depth_service init failed: %s", e)
 
+    # 大盘择时 / 情绪周期 / 风险雷达 刷新 (v0.3.39/40/41): 桌面端不常驻盘后管道,
+    # 且 `pipeline_regime_enabled` 默认 False → 这三张卡会长期停在旧日期。
+    # 这两项信号决定「仓位占比与持仓只数」, 所以**开盘前就必须是最新的**
+    # (用户: 「最迟 9:25 竞价结束」); 调度器另有 09:20 的定时刷新, 这里负责
+    # 「启动即补」+ 运行期周期复查, 覆盖笔记本关机后重新打开的场景。
+    # v0.3.40: 由「启动补一次」改为**周期性**补算 —— 桌面端常常连续开着好几天,
+    # 只在启动时补会让它跨过第二个交易日后再次停在旧日期 (用户诉求是「每天跟着
+    # 开盘日期即时更新」)。首次延迟 45s 让 enriched 预热先完成, 之后按
+    # 「当日数据是否还在变」选择复查节奏 (竞价后到收盘前 3 分钟一次, 其余 30 分钟);
+    # 数据新鲜时各步立即返回, 开销可忽略。
+    try:
+        import threading
+
+        def _market_context_catchup() -> None:
+            from app.services.market_context_refresh import refresh_market_context
+
+            result = refresh_market_context(store.data_dir)
+            if result.get("ok"):
+                if result.get("regime", {}).get("rows") or any(result.get("mainline", {}).values()):
+                    logger.info("market context catchup: %s", result)
+            else:
+                logger.warning("market context catchup 软失败: %s", result.get("errors"))
+
+        def _market_context_loop() -> None:
+            import time as _time
+
+            from app.market_time import data_refresh_interval_seconds
+
+            _time.sleep(45.0)  # 让 enriched 预热先完成
+            while True:
+                try:
+                    _market_context_catchup()
+                except Exception as e:  # noqa: BLE001 — 补算永不影响可用性
+                    logger.warning("market context catchup failed (soft): %s", e)
+                # v0.3.45: 竞价结束 (09:25) 到收盘 (15:05) 之间当日日K/情绪周期
+                # 还在变, 用户随时会打开页面看 → 这段时间 3 分钟复查一次;
+                # 窗口外 30 分钟一次即可 (数据一天才定型一次)。
+                _time.sleep(float(data_refresh_interval_seconds()))
+
+        _context_thread = threading.Thread(
+            target=_market_context_loop, name="market-context-catchup", daemon=True
+        )
+        _context_thread.start()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("market context catchup scheduling failed: %s", e)
+
     # 盘中分钟增量刷新 (Expert 专有): 线程常驻, 开关/时段/能力门控在循环内每轮判断
     try:
         from app.services.minute_refresh import MinuteRefreshService
@@ -256,7 +303,7 @@ async def _application_lifespan(app: FastAPI):
         minute_refresh.set_app_state(app.state)
         app.state.minute_refresh = minute_refresh
         minute_refresh.start()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — 初始化失败不阻断启动
         logger.warning("minute_refresh init failed: %s", e)
 
     # 停机缺口自检: 延迟后台扫描, 发现最近交易日的盘中快照/缺口时自动创建
@@ -414,13 +461,13 @@ async def _application_lifespan(app: FastAPI):
                 logger.info("matrix cache prewarm done: %s", result)
             except (HeavyJobCancelledError, MatrixPrewarmCancelledError):
                 logger.info("matrix cache prewarm cancelled")
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("matrix cache prewarm failed")
 
         if not matrix_prewarm_owner.schedule(_prewarm):
             logger.info("matrix cache prewarm already running or shutting down, skip")
 
-    repo._on_refresh_done = _schedule_matrix_cache_prewarm  # noqa: SLF001
+    repo._on_refresh_done = _schedule_matrix_cache_prewarm
     if repo.enriched_ready:
         _schedule_matrix_cache_prewarm()
 
@@ -478,7 +525,7 @@ async def _application_lifespan(app: FastAPI):
     try:
         yield
     finally:
-        repo._on_refresh_done = None  # noqa: SLF001
+        repo._on_refresh_done = None
         wd = getattr(app.state, "watchdog", None)
         if wd:
             await wd.stop()
@@ -514,6 +561,13 @@ async def _application_lifespan(app: FastAPI):
         from app.services.quote_service import shutdown_delivery_executors
 
         shutdown_delivery_executors()
+        # 风险提示线程池同理 (单 worker, 可能正在联网取外围行情)
+        try:
+            from app.services import risk_alert
+
+            risk_alert.shutdown()
+        except Exception as e:  # noqa: BLE001 — 停机阶段不得抛
+            logger.debug("risk_alert shutdown: %s", e)
         logger.info("shutdown")
 
 
@@ -664,6 +718,7 @@ app.include_router(pages_admin.router)
 app.include_router(paper.router)
 app.include_router(abnormal.router)
 app.include_router(regime.router)
+app.include_router(risk.router)
 app.include_router(analysis.router)
 app.include_router(pipeline.router)
 app.include_router(position_policies.router)
@@ -696,8 +751,6 @@ app.state.extension_load_errors = extension_load_errors
 # 能力门控异常 → 403(而非默认 500)
 # 业务代码用 capset.require(Cap.X) 断言能力,缺失时抛 CapabilityDenied;
 # 若不注册 handler 会冒泡成 500 Internal Server Error,对前端不友好且语义错误。
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 from app.tickflow.capabilities import CapabilityDenied
 

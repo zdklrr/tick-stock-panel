@@ -177,10 +177,15 @@ def test_immediate_fill_cash_and_positions_consistent(tmp_path, monkeypatch):
 
 
 def test_limit_up_buy_rejected(tmp_path, monkeypatch):
+    """显式关闭排队 (queue_limit_orders=False) → 触及涨停直接过期, 覆盖 V1 拒单分支。
+
+    默认已改为 True (排队次日重试), 排队路径由
+    test_limit_queue_retries_next_open_then_expires 覆盖。
+    """
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
     _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
-    _cap_account(tmp_path)
+    paper.create_account(tmp_path, 1_000_000, queue_limit_orders=False)
     order, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
     # 主板涨停 11.0; 快照 11 + 滑点 ≥ 涨停 → 拒单
     assert paper.evaluate_intraday(tmp_path, {SYM: 11.0}) == []
@@ -190,10 +195,11 @@ def test_limit_up_buy_rejected(tmp_path, monkeypatch):
 
 
 def test_limit_down_sell_rejected(tmp_path, monkeypatch):
+    """显式关闭排队 → 触及跌停直接过期 (排队路径见 test_limit_queue_*)。"""
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
     _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
-    _cap_account(tmp_path)
+    paper.create_account(tmp_path, 1_000_000, queue_limit_orders=False)
     _, err = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
     assert err is None
     paper.evaluate_intraday(tmp_path, {SYM: 10.0})
@@ -279,7 +285,7 @@ def test_pending_buy_occupies_cash_at_fill(tmp_path, monkeypatch):
 
 
 def test_position_symbol_cap(tmp_path, monkeypatch):
-    """持仓标的数上限: 第 51 只新开仓买入被拒 (加仓已有持仓不受限)。"""
+    """持仓标的数上限只在显式要求时生效 (默认不设限, 加仓已有持仓不受限)。"""
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
     _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
@@ -293,11 +299,20 @@ def test_position_symbol_cap(tmp_path, monkeypatch):
             "kind": "fill",
         })
     paper._materialize(tmp_path)
-    # 新开仓第 51 只 → 拒
-    _, err = paper.create_order(tmp_path, "601999.SH", "buy", qty=100, ref_price=10.0)
-    assert "上限" in err
+    # 默认不设限: 第 51 只新开仓照常放行 (仓位交给策略与风险, 不靠人为只数闸门)
+    ok, err = paper.create_order(tmp_path, "601999.SH", "buy", qty=100, ref_price=10.0)
+    assert err is None and ok["status"] == "pending"
+    # 显式要求上限时才拦 (调用方传入兜底常量)
+    _, err = paper.create_order(
+        tmp_path, "601999.SH", "buy", qty=100, ref_price=10.0,
+        max_position_symbols=paper.MAX_POSITION_SYMBOLS,
+    )
+    assert err is not None and "上限" in err
     # 加仓已有持仓 → 放行
-    ok, err = paper.create_order(tmp_path, "600000.SH", "buy", qty=100, ref_price=10.0)
+    ok, err = paper.create_order(
+        tmp_path, "600000.SH", "buy", qty=100, ref_price=10.0,
+        max_position_symbols=paper.MAX_POSITION_SYMBOLS,
+    )
     assert err is None and ok["status"] == "pending"
 
 
@@ -365,6 +380,152 @@ def test_nav_and_overview_math(tmp_path, monkeypatch):
     paper._write_nav_line(tmp_path, day.isoformat(), nav)
     lines = paper.load_nav(tmp_path)
     assert len(lines) == 1 and lines[0]["nav"] == pytest.approx(nav["nav"])
+
+
+def test_overview_daily_valuation_gives_pnl_outside_session(tmp_path, monkeypatch):
+    """非交易时段 (无 price_map) 也要有浮盈与今日盈亏。
+
+    回归背景: overview 原先只有传入 price_map 才估值, 其余时刻退回成本价,
+    导致盘前/收盘后/周末持仓浮盈全部显示 0, 用户以为「昨天的收益没了」。
+    """
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    _write_daily(tmp_path, [(day - timedelta(days=2), 10.0, 10.0), (day - timedelta(days=1), 10.0, 10.5)])
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    paper.evaluate_intraday(tmp_path, {SYM: 10.0})
+
+    # 成本价口径 (内部调用方默认): 浮盈为 0, 保证计划/结算股数不变
+    cost = paper.overview(tmp_path)
+    assert cost["estimating"] is False
+    assert cost["holdings"][0]["pnl"] == pytest.approx(0.0)
+    assert cost["price_source"] == "cost"
+
+    # 日线口径 (展示层): 用最近收盘 10.5 估值, 浮盈非 0, 且给出今日盈亏
+    daily = paper.overview(tmp_path, valuation="daily")
+    assert daily["estimating"] is False  # estimating 仅表示「盘中实时」
+    assert daily["price_source"] == "daily"
+    row = daily["holdings"][0]
+    assert row["priced"] is True
+    assert row["price_date"] == (day - timedelta(days=1)).isoformat()
+    assert row["last_price"] == pytest.approx(10.5)
+    assert row["pnl"] > 0
+    assert row["prev_close"] == pytest.approx(10.0)
+    assert row["day_pnl"] == pytest.approx(1000 * (10.5 - 10.0))
+    assert daily["market_value"] > cost["market_value"]
+
+
+def test_overview_live_price_still_gives_row_day_pnl(tmp_path, monkeypatch):
+    """盘中实时口径 (price_map) 也要给出每只持仓的今日盈亏。
+
+    回归背景: 实时分支原先 `prev = None if price_map is not None` 直接把昨收抹掉,
+    NAS 上实测 2/2 持仓 day_pnl 全为 null, 前端持仓表「今日盈亏」列恒 `--`。
+    实时快照只有现价, 昨收必须回日线取。
+    """
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    _write_daily(
+        tmp_path,
+        [(day - timedelta(days=3), 10.0, 10.0), (day - timedelta(days=1), 10.0, 10.5)],
+    )
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    paper.evaluate_intraday(tmp_path, {SYM: 10.0})
+
+    live = paper.overview(tmp_path, {SYM: 11.0})
+    assert live["estimating"] is True
+    assert live["price_source"] == "live"
+    row = live["holdings"][0]
+    assert row["last_price"] == pytest.approx(11.0)
+    # 昨收来自日线最后一根 (day-1 的 10.5), 不是成本价, 也不是 None
+    assert row["prev_close"] == pytest.approx(10.5)
+    assert row["day_pnl"] == pytest.approx(1000 * (11.0 - 10.5))
+    assert row["day_pnl_pct"] == pytest.approx((11.0 / 10.5 - 1) * 100, abs=0.01)
+
+
+def test_overview_live_prev_close_skips_intraday_bar(tmp_path, monkeypatch):
+    """日线最新一根就是今天(盘中未定型 bar) 时, 昨收要退到再前一根。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    _write_daily(
+        tmp_path,
+        [(day - timedelta(days=1), 10.0, 10.5), (day, 10.5, 10.8)],
+    )
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    paper.evaluate_intraday(tmp_path, {SYM: 10.0})
+
+    live = paper.overview(tmp_path, {SYM: 11.0})
+    row = live["holdings"][0]
+    # 今天那根 10.8 不能当作昨收; 正确昨收是昨日收盘 10.5
+    assert row["prev_close"] == pytest.approx(10.5)
+    assert row["day_pnl"] == pytest.approx(1000 * (11.0 - 10.5))
+
+
+def test_overview_daily_valuation_degrades_when_no_history(tmp_path, monkeypatch):
+    """日线缺失时降级成本价, 不抛异常, price_source=cost。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    paper.evaluate_intraday(tmp_path, {SYM: 10.0})
+
+    ov = paper.overview(tmp_path, valuation="daily")
+    assert ov["initialized"] is True
+    assert ov["price_source"] == "cost"
+    assert ov["holdings"][0]["priced"] is False
+    assert ov["holdings"][0]["pnl"] == pytest.approx(0.0)
+
+
+def test_overview_day_pnl_from_prev_nav(tmp_path, monkeypatch):
+    """今日盈亏优先用「当前总资产 − 上一交易日定版净值」(含当日已实现)。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    prev_day = (day - timedelta(days=1)).isoformat()
+    paper._write_nav_line(tmp_path, prev_day, {"date": prev_day, "cash": 100_000.0, "mv": 0.0, "nav": 100_000.0})
+
+    ov = paper.overview(tmp_path, valuation="daily")
+    assert ov["day_pnl"] == pytest.approx(0.0)
+    assert ov["day_pnl_pct"] == pytest.approx(0.0)
+
+
+def test_order_and_fill_and_position_carry_name(tmp_path, monkeypatch):
+    """下单已知名称时随订单/成交落盘, 重放后持仓也带名称 (维表残缺时兜底)。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    order, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0, name="贵州茅台")
+    assert err is None
+    assert order["name"] == "贵州茅台"
+
+    paper.evaluate_intraday(tmp_path, {SYM: 10.0})
+    fill = next(f for f in paper.load_fills(tmp_path) if f.get("kind", "fill") == "fill")
+    assert fill["name"] == "贵州茅台"
+
+    pos = paper.load_positions(tmp_path)[SYM]
+    assert pos.get("name") == "贵州茅台"
+
+
+def test_replay_keeps_existing_name_when_fill_lacks_it(tmp_path, monkeypatch):
+    """老台账没 name 字段时不清空已有持仓名称。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _cap_account(tmp_path, 100_000.0)
+    for f in (
+        {"seq": 1, "ts": "", "date": day.isoformat(), "order_id": "o1", "symbol": SYM,
+         "name": "贵州茅台", "asset_type": "stock", "side": "buy", "qty": 100,
+         "price": 10.0, "fee": 5.0, "kind": "fill"},
+        {"seq": 2, "ts": "", "date": day.isoformat(), "order_id": "o2", "symbol": SYM,
+         "asset_type": "stock", "side": "buy", "qty": 100, "price": 10.0, "fee": 5.0, "kind": "fill"},
+    ):
+        paper._append_fill(tmp_path, f)
+    paper.rebuild_positions(tmp_path)
+    assert paper.load_positions(tmp_path)[SYM]["name"] == "贵州茅台"
 
 
 def test_round_trips_fifo_stats(tmp_path):
@@ -498,10 +659,17 @@ def test_max_drawdown_pure():
 
 
 # ── 涨跌停排队 (V2: queue_limit_orders) ─────────────────
-def test_limit_queue_default_off_rejects_immediately(tmp_path, monkeypatch):
-    """默认关闭: 触及涨停直接过期 (与 V1 行为一致, 由 test_limit_up_buy_rejected 锁定)。"""
+def test_limit_queue_default_on_and_explicit_off(tmp_path, monkeypatch):
+    """撮合口径默认排队: 新账户默认 queue_limit_orders=True; 显式 False 可退回拒单。
+
+    语义变更: 用户要求「涨停板不能买得进去不符合逻辑」, 默认改为排队次日重试,
+    显式关闭时仍保留 V1 直接过期行为 (由 test_limit_up_buy_rejected 锁定)。
+    """
     acc = _cap_account(tmp_path)
-    assert acc["queue_limit_orders"] is False
+    assert acc["queue_limit_orders"] is True
+    off = paper.create_account(tmp_path, 1_000_000, account_id="acc_off", queue_limit_orders=False)
+    assert off["queue_limit_orders"] is False
+    assert paper.get_account(tmp_path, "acc_off")["queue_limit_orders"] is False
 
 
 def test_limit_queue_retries_next_open_then_expires(tmp_path, monkeypatch):
@@ -589,7 +757,8 @@ def test_multi_account_isolation(tmp_path, monkeypatch):
     infos = {a["id"]: a for a in paper.list_accounts(tmp_path)}
     assert set(infos) == {"default", "acc_a"} and infos["acc_a"]["name"] == "策略A"
 
-    # settings 只影响目标账户
+    # settings 只影响目标账户 (默认已为 True, 这里显式关掉 default 再单独开 acc_a)
+    paper.update_settings(tmp_path, "default", queue_limit_orders=False)
     paper.update_settings(tmp_path, "acc_a", queue_limit_orders=True)
     assert paper.get_account(tmp_path, "default")["queue_limit_orders"] is False
     assert paper.get_account(tmp_path, "acc_a")["queue_limit_orders"] is True
@@ -694,3 +863,64 @@ def test_limit_pct_star_689():
     # 科创板 689 号段 (存托凭证, 如 689009.SH 九号公司) 为 ±20%,
     # 与 price_limits.board_limit_pct 一致
     assert paper.limit_pct("689009.SH", "stock") == 0.20
+
+
+# ── 成交事件账户名 / overview 仓位占比 ──────────────────
+def test_fill_event_account_name_prefix_and_field(tmp_path, monkeypatch):
+    """_fill_event: 带账户名时 message 前缀 [账户名] 且事件带 account_name;
+    不带时保持原文案 (向后兼容), account_name 回落 account_id。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=1000, ref_price=10.0)
+    assert err is None
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0})) == 1
+
+    fill = next(f for f in paper.load_fills(tmp_path) if f.get("kind") == "fill")
+    price = float(fill["price"])
+    ev = paper._fill_event(fill, "default")
+    assert ev["account_name"] == "default"          # 无账户名 → 回落 account_id
+    assert ev["message"] == f"模拟盘买入成交 1000股 @ {price:.2f}"   # 无滑点前缀 (向后兼容)
+
+    ev_named = paper._fill_event(fill, "default", account_name="主账户")
+    assert ev_named["account_name"] == "主账户"
+    assert ev_named["message"] == f"[主账户] 模拟盘买入成交 1000股 @ {price:.2f}"
+
+    # day_fill_events (盘后结算路径) 也带账户名
+    acc = paper.get_account(tmp_path)
+    paper.save_account(tmp_path, {**acc, "name": "主账户"})
+    (ev2,) = paper.day_fill_events(tmp_path, day.isoformat())
+    assert ev2["account_name"] == "主账户"
+    assert "[主账户]" in ev2["message"]
+
+
+def test_overview_holdings_position_pct(tmp_path):
+    """overview holdings 行带 position_pct (市值 / (现金+市值)); 分母 0 不炸。"""
+    acc = _cap_account(tmp_path, cash=100_000.0)
+    # 手工造持仓: 1000 股 @ 10 → mv=10000, total=110000 → 9.09%
+    root = paper._root(tmp_path)
+    (root / "positions.json").write_text(
+        __import__("json").dumps(
+            {"positions": {SYM: {"asset_type": "stock", "qty": 1000, "avg_cost": 10.0,
+                                 "available_qty": 1000, "lots": [{"date": "2026-01-01", "qty": 1000}]}}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ov = paper.overview(tmp_path, {SYM: 10.0})
+    h = ov["holdings"][0]
+    assert h["position_pct"] == 9.09
+    assert ov["market_value"] == 10000.0 and ov["total"] == 110000.0
+    assert acc is not None
+
+    # 分母 = 0 (现金 0 + 无持仓) → 全行 0.0, 不抛
+    paper.create_account(tmp_path, 100.0, account_id="zero")  # create_account 拒绝 0 本金
+    acc0 = paper.get_account(tmp_path, "zero")
+    acc0["cash"] = 0.0
+    paper.save_account(tmp_path, acc0, "zero")
+    (paper._root(tmp_path, "zero") / "positions.json").write_text(
+        __import__("json").dumps({"positions": {}}, ensure_ascii=False), encoding="utf-8",
+    )
+    ov0 = paper.overview(tmp_path, account_id="zero")
+    assert ov0["holdings"] == [] and ov0["total"] == 0.0

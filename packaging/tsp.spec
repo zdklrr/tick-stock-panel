@@ -84,6 +84,8 @@ hiddenimports += collect_submodules("polars")
 datas += [
     (str(ROOT / "backend" / "app" / "plugins" / "fuyao" / "plugin.yaml"), "app/plugins/fuyao"),
     (str(ROOT / "backend" / "app" / "plugins" / "tdxquant" / "plugin.yaml"), "app/plugins/tdxquant"),
+    (str(ROOT / "backend" / "app" / "plugins" / "tencent" / "plugin.yaml"), "app/plugins/tencent"),
+    (str(ROOT / "backend" / "app" / "plugins" / "sina" / "plugin.yaml"), "app/plugins/sina"),
 ]
 hiddenimports += [
     "app.plugins.fuyao.provider",
@@ -91,6 +93,10 @@ hiddenimports += [
     "app.plugins.tdxquant.provider",
     "app.plugins.tdxquant.client",
     "app.plugins.tdxquant.probe",
+    "app.plugins.tencent.provider",
+    "app.plugins.tencent.client",
+    "app.plugins.sina.provider",
+    "app.plugins.sina.client",
 ]
 
 # ── 后端源码扩展 (app/custom/*) ──────────────────────────────────────

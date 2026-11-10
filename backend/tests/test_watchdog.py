@@ -83,3 +83,39 @@ async def test_default_probe_passes_on_healthy_resources() -> None:
     lock = threading.Lock()
     default_probe(lock)  # 不抛即通过
     default_probe(None)
+
+
+async def test_default_probe_write_lock_busy_is_not_failure() -> None:
+    # 回归 (2026-11 NAS 事故): 每日管道 compute_enriched / enriched warmup
+    # 长时间持有 repo._write_lock 属正常后台忙, 写锁 acquire 超时不应抛异常,
+    # 否则 watchdog 连续失败 → 进程自杀重启 → regime/mainline 阶段没跑到。
+    import threading
+
+    lock = threading.Lock()
+    with lock:  # 先占用写锁, 模拟后台管道持锁
+        # 不抛即通过 (旧实现会 raise TimeoutError("repository write lock unavailable"))
+        default_probe(lock)
+    # 释放后同样通过
+    default_probe(lock)
+
+
+async def test_default_probe_collect_failure_still_raises() -> None:
+    # collect 挂死仍是僵死信号 (2026-09-07 事故形态), 必须照常计失败。
+    import threading
+
+    from app import watchdog as wd_mod
+
+    lock = threading.Lock()
+
+    def _boom(lf):
+        raise RuntimeError("collect wedged")
+
+    original = wd_mod.guarded_collect
+    try:
+        wd_mod.guarded_collect = _boom
+        import pytest
+
+        with pytest.raises(RuntimeError, match="collect wedged"):
+            wd_mod.default_probe(lock)
+    finally:
+        wd_mod.guarded_collect = original

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, SlidersHorizontal } from 'lucide-react'
+import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, SlidersHorizontal, ClipboardList } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { fetchMinuteBatchIncremental } from '@/lib/minuteBatchIncremental'
 import { fetchDailyBatchChunked } from '@/lib/klineBatchChunked'
@@ -20,6 +20,7 @@ import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { useStrategyPool } from '@/lib/useStrategyPool'
 import { StrategyCard, CardSize, loadCardSize, cardWrapCls } from '@/components/screener/StrategyCard'
 import { ScreenerTable } from '@/components/screener/ScreenerTable'
+import { StrategyPlanDialog } from '@/components/screener/StrategyPlanDialog'
 import type { MiniIntradayYMode } from '@/components/stock-table/MiniIntraday'
 import { ScreenerFilter as ScreenerFilterType, defaultFilter, filterActive, countActiveFilters, applyFilter, FilterPanel } from '@/components/screener/ScreenerFilter'
 import { StrategySettingsDialog } from '@/components/screener/StrategySettingsDialog'
@@ -64,6 +65,9 @@ export function Screener() {
     setPreviewNavList([])
   }, [])
   const [settingsStrategyId, setSettingsStrategyId] = useState<string | null>(null)
+  // 行选择: 用于「生成交易计划」把勾选的标的转成模拟盘交易计划 (结果变化时清空)
+  const [selectedSymbols, setSelectedSymbols] = useState<Set<string>>(new Set())
+  const [showPlanDialog, setShowPlanDialog] = useState(false)
   const [showPoolDialog, setShowPoolDialog] = useState(false)
   const [showBuilder, setShowBuilder] = useState(false)
   const [builderMode, setBuilderMode] = useState<'create' | 'modify'>('create')
@@ -865,6 +869,44 @@ export function Screener() {
     })
   }
 
+  // ── 行选择: 结果集变化 (换策略/重新运行/筛选) 时清空, 避免把上一批标的带进计划 ----
+  const selectableSymbols = useMemo(
+    () => displayRows.filter((r: any) => !r._expired).map((r: any) => String(r.symbol)),
+    [displayRows],
+  )
+  useEffect(() => {
+    setSelectedSymbols(prev => {
+      if (prev.size === 0) return prev
+      const valid = new Set(selectableSymbols)
+      const next = new Set([...prev].filter(s => valid.has(s)))
+      return next.size === prev.size ? prev : next
+    })
+  }, [selectableSymbols])
+
+  const toggleSelect = useCallback((symbol: string) => {
+    setSelectedSymbols(prev => {
+      const next = new Set(prev)
+      if (next.has(symbol)) next.delete(symbol)
+      else next.add(symbol)
+      return next
+    })
+  }, [])
+  const allSelected = selectableSymbols.length > 0 && selectableSymbols.every(s => selectedSymbols.has(s))
+  const toggleSelectAll = useCallback(() => {
+    setSelectedSymbols(prev => {
+      const all = selectableSymbols.length > 0 && selectableSymbols.every(s => prev.has(s))
+      return all ? new Set<string>() : new Set(selectableSymbols)
+    })
+  }, [selectableSymbols])
+  // 传给交易计划弹窗的行: 有勾选就只带勾选的, 没勾选则默认全部可见行。
+  // 必须 memo —— 否则每次父级渲染都产生新数组, 弹窗内按 rows 初始化的勾选会被重置。
+  const planRows = useMemo(
+    () => (selectedSymbols.size === 0
+      ? displayRows
+      : displayRows.filter((r: any) => selectedSymbols.has(r.symbol))),
+    [displayRows, selectedSymbols],
+  )
+
 
   return (
     <>
@@ -1190,6 +1232,19 @@ export function Screener() {
                       {batchAdd.isPending ? '添加中…' : '批量加自选'}
                     </WatchlistAddMenu>
                   )}
+                  {/* 把勾选的标的转成模拟盘交易计划: 价格进区间自动买入, 触止损/目标自动卖出 */}
+                  {displayRows.length > 0 && (
+                    <button
+                      onClick={() => setShowPlanDialog(true)}
+                      title="把勾选的标的生成模拟盘交易计划（不勾选则默认全部可见标的）"
+                      className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-btn
+                        border border-accent/40 bg-accent/10 text-accent text-xs font-medium
+                        hover:bg-accent/20 transition-colors duration-150 cursor-pointer"
+                    >
+                      <ClipboardList className="h-3 w-3" />
+                      生成交易计划{selectedSymbols.size > 0 ? ` (${selectedSymbols.size})` : ''}
+                    </button>
+                  )}
                   <button
                     onClick={() => setCustomizerOpen(true)}
                     title="列表配置"
@@ -1280,6 +1335,17 @@ export function Screener() {
                     onSortToggle={toggle}
                     extSeriesData={extSeriesData}
                     auctionData={auctionData}
+                    selectedSymbols={selectedSymbols}
+                    onToggleSelect={toggleSelect}
+                    onToggleSelectAll={toggleSelectAll}
+                    allSelected={allSelected}
+                    selectableCount={selectableSymbols.length}
+                  />
+                  <StrategyPlanDialog
+                    open={showPlanDialog}
+                    onClose={() => setShowPlanDialog(false)}
+                    rows={planRows}
+                    selected={selectedSymbols}
                   />
                 </>
               )}

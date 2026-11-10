@@ -11,6 +11,7 @@ import { playNotificationSound } from '@/lib/notificationSound'
 import { speakAlerts } from '@/lib/voiceBroadcast'
 import { usePreferences } from '@/lib/useSharedQueries'
 import { strategyEventMeta, strategyName } from '@/lib/strategyMonitorEvents'
+import { filterNoiseAlerts, readMonitorNoise } from '@/lib/storage'
 
 /** 通知渠道分发 — 所有副作用渠道在此汇合, 新增渠道只改这里 */
 function dispatchSideEffects(alerts: AlertEvent[]) {
@@ -60,8 +61,12 @@ export function pushAlertToast(alert: AlertEvent) {
 export function pushAlertToasts(alerts: AlertEvent[]) {
   if (alerts.length === 0) return
   if (!getEnabled()) return                  // 开关关闭: 不弹
+  // 噪音过滤: 用户在监控中心关掉的「自动跟单/成交」不再弹窗, 也不触发提示音与语音。
+  // 必须在 dispatchSideEffects 之前过滤, 否则声音照样刷屏。
+  const shown = filterNoiseAlerts(alerts, readMonitorNoise())
+  if (shown.length === 0) return
   const maxVisible = getMaxVisible()
-  const newItems = alerts.map(alert => ({ id: ++_id, alert }))
+  const newItems = shown.map(alert => ({ id: ++_id, alert }))
   _queue = [..._queue, ...newItems]
   // 超出上限: 丢弃最旧的
   if (_queue.length > maxVisible) {
@@ -71,12 +76,18 @@ export function pushAlertToasts(alerts: AlertEvent[]) {
   for (const item of newItems) {
     setTimeout(() => dismiss(item.id), AUTO_DISMISS)
   }
-  dispatchSideEffects(alerts)                  // 副作用分发: 提示音 + 语音 (整批各一次)
+  dispatchSideEffects(shown)                   // 副作用分发: 提示音 + 语音 (整批各一次)
 }
 
 /** 手动关闭 */
 export function dismiss(id: number) {
   _queue = _queue.filter(t => t.id !== id)
+  _emit()
+}
+
+/** 清空全部 toast (模块级 _queue 是跨容器共享的, 测试用例间必须清场, 否则上一条用例的 toast 会泄进下一条) */
+export function clearAlertToasts() {
+  _queue = []
   _emit()
 }
 
@@ -98,6 +109,7 @@ const SOURCE_BADGE: Record<string, { label: string; cls: string }> = {
   new_entry: { label: '进入', cls: 'bg-danger/15 text-danger' },
   dropped:   { label: '移出', cls: 'bg-bear/15 text-bear' },
   paper:     { label: '模拟盘', cls: 'bg-sky-400/15 text-sky-500 dark:text-sky-300' },
+  risk:      { label: '风险提示', cls: 'bg-danger/15 text-danger' },
 }
 
 // ===== 容器 — 挂在 Layout =====
@@ -140,6 +152,7 @@ export function AlertToastContainer() {
           const badge = SOURCE_BADGE[badgeKey] ?? { label: badgeKey, cls: 'bg-elevated text-muted' }
           const pct = ev.change_pct ?? 0
           const isStrategy = ev.source === 'strategy'
+          const isPaper = ev.source === 'paper'
           const sname = isStrategy ? strategyName(ev.message ?? '') : ''
           const eventMeta = strategyEventMeta(ev.type)
           return (
@@ -171,7 +184,14 @@ export function AlertToastContainer() {
                   {badge.label}
                 </span>
                 {ev.symbol && <span className="font-mono text-xs font-medium text-foreground shrink-0">{ev.symbol}</span>}
+                {/* 名称有值就紧跟代码展示 (模拟盘事件由后端回填); 为空时不留空占位 */}
                 {ev.name && <span className="text-xs text-secondary truncate flex-1">{ev.name}</span>}
+                {/* v0.3.34: 模拟盘买入提醒显示所属账户徽章 (非 paper 来源不显示) */}
+                {isPaper && ev.account_name && (
+                  <span className="shrink-0 rounded-full bg-elevated px-1.5 py-px text-[10px] text-muted">
+                    账户：{ev.account_name}
+                  </span>
+                )}
                 {ev.change_pct != null && (
                   <span className={cn('inline-flex items-center gap-0.5 text-[10px] font-mono font-medium shrink-0', pct >= 0 ? 'text-danger' : 'text-bear')}>
                     {pct >= 0 ? <TrendingUp className="h-2.5 w-2.5" /> : <TrendingDown className="h-2.5 w-2.5" />}
@@ -213,10 +233,16 @@ export function AlertToastContainer() {
                   )}
                 </>
               ) : (
-                <div className="mt-1 flex items-center gap-1.5 pl-0.5">
-                  <Bell className={cn('h-3 w-3 shrink-0', sev.replace('bg-', 'text-'))} />
-                  {/* message 已含「条件摘要 · 现价 · 涨跌幅」(后端生成), 直接展示避免重复 */}
-                  {ev.message && <span className="text-[11px] text-foreground/70 truncate flex-1">{ev.message}</span>}
+                <div className={cn('mt-1 flex gap-1.5 pl-0.5', isPaper ? 'items-start' : 'items-center')}>
+                  <Bell className={cn('h-3 w-3 shrink-0', sev.replace('bg-', 'text-'), isPaper && 'mt-0.5')} />
+                  {/* message 已含「条件摘要 · 现价 · 涨跌幅」(后端生成), 直接展示避免重复。
+                      模拟盘文案较长 (股票名称 + 规则名 + 触发原因 + 成交方式), 给两行
+                      避免关键信息被单行截断; 其他来源保持单行。 */}
+                  {ev.message && (
+                    isPaper
+                      ? <span className="min-w-0 flex-1 break-words text-[11px] leading-snug text-foreground/70 line-clamp-2">{ev.message}</span>
+                      : <span className="text-[11px] text-foreground/70 truncate flex-1">{ev.message}</span>
+                  )}
                 </div>
               )}
 

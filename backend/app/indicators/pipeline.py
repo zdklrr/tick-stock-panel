@@ -718,6 +718,80 @@ def _attach_no_limit_window(inst_subset: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+# ── 维表涨跌停价的陈旧快照识别 (v0.3.37) ────────────────
+# instruments 维表的 limit_up / limit_down 是**数据源按某个交易日收盘算出的快照**,
+# 而维表的 as_of 列是落盘时统一打的当日日期 —— 数据源滞后时两者并不一致。
+# NAS 实测 (2026-11-04): 维表 limit_up 与 2026-11-02 收盘算出的涨停价
+# 5211/5216 = 99.9% 精确相符, 与 11-04 当日只有 6.4% 相符 → 这份价格是 11-02
+# 的快照却被标成 as_of=11-04。后果双向: 前一日下跌的标的旧涨停价偏高 →
+# 88 只真涨停被判「未涨停」; 前一日上涨的标的旧涨停价偏低 → 16 只普通上涨被
+# 判「涨停」; 连板数与封板率随之双双失真 (看板 34 vs 真实 123)。
+#
+# 识别方法: 权威价能反推出「按哪个昨收算的涨停价」——
+#       implied_prev = limit_up / (1 + pct)
+# 若 implied_prev 与**更早某个交易日**的收盘价精确相符 (而与前一日不符),
+# 说明这个价格是那一天的快照, 不能用于今天。反之若 implied_prev 与前一日
+# 相符, 或者与任何历史日都不相符 (可能是交易所特殊口径: ST 调档、除权参考价、
+# 最小变动单位取整), 都保留权威值 —— 这些正是权威价存在的意义, 不能一刀切
+# 拿理论价覆盖。
+_STALE_SNAPSHOT_LOOKBACK = 4      # 往回找几个交易日
+_STALE_SNAPSHOT_TOL = 0.011       # 价格比对容差 (1 分钱 + 浮点余量)
+
+
+def _stale_snapshot_expr(
+    authoritative: pl.Expr,
+    limit_pct: pl.Expr,
+    prev_close: pl.Expr,
+    up: bool,
+) -> pl.Expr:
+    """权威涨跌停价是否来自「更早某个交易日」的陈旧快照。
+
+    Args:
+        authoritative: 维表给的涨跌停价。
+        limit_pct: 该标的该日的涨跌幅比例 (0.10 / 0.20 / 0.30)。
+        prev_close: 当日实际使用的昨收基准价 (除权日用除权参考价)。
+        up: True 算涨停价, False 算跌停价。
+    """
+    base = (1.0 + limit_pct) if up else (1.0 - limit_pct)
+    implied = authoritative / pl.when(base > 0).then(base).otherwise(None)
+
+    def _close_matches(close: pl.Expr) -> pl.Expr:
+        return (
+            implied.is_not_null()
+            & close.is_not_null()
+            & ((implied - close).abs() <= _STALE_SNAPSHOT_TOL)
+        ).fill_null(False)
+
+    # 与当日昨收相符 → 是今天的价, 不是陈旧快照
+    matches_today = _close_matches(prev_close)
+    older = pl.lit(False)
+    for k in range(2, _STALE_SNAPSHOT_LOOKBACK + 1):
+        older = older | _close_matches(pl.col("raw_close").shift(k).over("symbol"))
+    return older & (~matches_today)
+
+
+def _implied_prev_mismatch(
+    authoritative: pl.Expr,
+    limit_pct: pl.Expr,
+    prev_close: pl.Expr,
+    up: bool,
+) -> pl.Expr:
+    """权威价反推出的昨收与当日昨收不一致 (盘中路径用, 无历史可回溯)。
+
+    盘中只有单日行情, 无法判断「更早哪一天」, 因此只用一层判定:
+    权威价 / (1±幅度) 必须与当日昨收分毫相符。本项目的理论价在真实数据上
+    已 132/132 精确复现交易所价格 (整数分算术 + 板块/ST 档位), 所以不符基本
+    只有一种可能 —— 这个价来自别的交易日。
+    """
+    base = (1.0 + limit_pct) if up else (1.0 - limit_pct)
+    implied = authoritative / pl.when(base > 0).then(base).otherwise(None)
+    return (
+        implied.is_not_null()
+        & prev_close.is_not_null()
+        & ((implied - prev_close).abs() > _STALE_SNAPSHOT_TOL)
+    ).fill_null(False)
+
+
 def compute_limit_signals(
     df: pl.DataFrame,
     instruments: pl.DataFrame,
@@ -863,20 +937,31 @@ def compute_limit_signals(
         # >0 与实时路径 (_compute_limit_signals_today) 同守卫: 维表 limit_up 为 0
         # (数据源未提供该字段的占位值) 不是权威价, 直接采用会让 raw_close >= -0.005
         # 恒成立, 全部标的被判涨停。
+        # v0.3.37: 再加一层「陈旧快照」识别 —— 维表价格是数据源按某个交易日收盘
+        # 算出的快照, as_of 却是落盘日期, 两者可能错位一天。若这个价能反推出的是
+        # 更早某个交易日的昨收 (而不是当日昨收), 就不能用于今天。
+        stale_up = _stale_snapshot_expr(
+            pl.col("limit_up"), pl.col("_limit_pct"), pl.col("_prev_raw_close"), up=True
+        )
         effective_limit_up = pl.when(
             authoritative_date
             & pl.col("limit_up").is_not_null()
             & (pl.col("limit_up") > 0)
             & (pl.col("limit_up") < _SENTINEL)
+            & (~stale_up)
         ).then(pl.col("limit_up")).otherwise(pl.col("_theoretical_limit_up"))
     else:
         effective_limit_up = pl.col("_theoretical_limit_up")
     if "limit_down" in df.columns:
+        stale_down = _stale_snapshot_expr(
+            pl.col("limit_down"), pl.col("_limit_pct"), pl.col("_prev_raw_close"), up=False
+        )
         effective_limit_down = pl.when(
             authoritative_date
             & pl.col("limit_down").is_not_null()
             & (pl.col("limit_down") > 0)
             & (pl.col("limit_down") < _SENTINEL)
+            & (~stale_down)
         ).then(pl.col("limit_down")).otherwise(pl.col("_theoretical_limit_down"))
     else:
         effective_limit_down = pl.col("_theoretical_limit_down")
@@ -2413,11 +2498,20 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
     has_authoritative_down = pl.lit(False)
     no_price_limit = pl.lit(False)
     if "limit_up" in df.columns:
+        # v0.3.37: 陈旧快照识别。盘中只有单日行情, 没有历史序列可回溯 →
+        # 改用更强也更简单的一层判定: 权威价与今日昨收推不出来就不可信。
+        # 交易所权威价必然 = 今日昨收 × (1 ± 幅度) 取整到最小变动单位, 隐含
+        # 昨收与今日昨收必然分毫相符; 追不上说明它是别的交易日的快照。
+        # 保留「与历史某日相符」的分支无意义 (盘中无历史), 故此处直接比对今日。
+        _stale_up = _implied_prev_mismatch(
+            pl.col("limit_up"), limit_pct, prev_raw, up=True
+        )
         has_authoritative_up = (
             authoritative_date
             & pl.col("limit_up").is_not_null()
             & (pl.col("limit_up") > 0)
             & (pl.col("limit_up") < _SENTINEL)
+            & (~_stale_up)
         )
         no_price_limit = (
             authoritative_date
@@ -2430,11 +2524,15 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
     else:
         effective_limit_up = limit_up_price
     if "limit_down" in df.columns:
+        _stale_down = _implied_prev_mismatch(
+            pl.col("limit_down"), limit_pct, prev_raw, up=False
+        )
         has_authoritative_down = (
             authoritative_date
             & pl.col("limit_down").is_not_null()
             & (pl.col("limit_down") > 0)
             & (pl.col("limit_down") < _SENTINEL)
+            & (~_stale_down)
         )
         effective_limit_down = pl.when(
             has_authoritative_down

@@ -10,10 +10,12 @@ import type { StrategyDetail } from '@/lib/api'
 
 const mockStrategyList = vi.fn()
 const mockStrategyPublish = vi.fn(async (id: string) => ({ ok: true, strategy_id: id }))
+const mockStrategyDelete = vi.fn(async (..._args: unknown[]) => ({ ok: true }))
 vi.mock('@/lib/api', () => ({
   api: {
     strategyList: (...args: unknown[]) => mockStrategyList(...args),
     strategyPublish: (id: string) => mockStrategyPublish(id),
+    strategyDelete: (id: string) => mockStrategyDelete(id),
   },
 }))
 
@@ -63,6 +65,7 @@ beforeEach(() => {
   mockStrategyList.mockReset()
   mockStrategyList.mockResolvedValue({ strategies: [aiDraft, builtinResearch, builtinPublic, compositePublic] })
   mockStrategyPublish.mockClear()
+  mockStrategyDelete.mockClear()
 })
 afterEach(() => {
   if (root) { act(() => { root!.unmount() }); root = null }
@@ -200,4 +203,68 @@ it('undoes clearing even when the selected strategies have not yet been saved', 
   act(() => button('撤销清空').click())
   expect(choice('趋势跟随').checked).toBe(true)
   expect(choice('混合叠加').checked).toBe(true)
+})
+
+// ── 删除策略文件 (与「移出策略池」区分) ───────────────────────────
+const deleteBtn = (name: string) => container.querySelector<HTMLButtonElement>(`[aria-label="删除策略：${name}"]`)!
+const confirmDialog = () => document.querySelector('[aria-label="删除策略确认"]')
+
+it('library rows expose a delete button that requires explicit confirmation', async () => {
+  const confirm = vi.fn()
+  await render({ pool: [], onConfirm: confirm })
+
+  act(() => deleteBtn('趋势跟随').click())
+  const dialog = confirmDialog()
+  expect(dialog).toBeTruthy()
+  expect(dialog!.textContent).toContain('趋势跟随')
+  // 仅点开确认框不得删除
+  expect(mockStrategyDelete).not.toHaveBeenCalled()
+
+  const confirmBtn = [...dialog!.querySelectorAll('button')].find(b => b.textContent?.includes('确认删除'))!
+  await act(async () => { confirmBtn.click() })
+  expect(mockStrategyDelete).toHaveBeenCalledWith('trend_follow')
+  // 删除的是策略文件, 与「保存策略池」无关
+  expect(confirm).not.toHaveBeenCalled()
+  expect(confirmDialog()).toBeNull()
+})
+
+it('cancelling the delete dialog never calls the delete API', async () => {
+  await render({ pool: [], onConfirm: () => {} })
+  act(() => deleteBtn('趋势跟随').click())
+  const cancelBtn = [...confirmDialog()!.querySelectorAll('button')].find(b => b.textContent?.trim() === '取消')!
+  act(() => { cancelBtn.click() })
+  expect(mockStrategyDelete).not.toHaveBeenCalled()
+  expect(confirmDialog()).toBeNull()
+  // 取消删除不影响策略勾选状态
+  expect(choice('趋势跟随').checked).toBe(false)
+})
+
+it('research templates cannot be deleted from the pool at all', async () => {
+  await render({ pool: [], onConfirm: () => {} })
+  // 研究模板不进待选列表 (既有行为), 因此也拿不到它的删除按钮
+  expect(container.textContent).not.toContain('因子排名研究')
+  expect(container.querySelector('[aria-label="删除策略：因子排名研究"]')).toBeNull()
+})
+
+it('removing a deleted strategy from the pool keeps it out of the saved pool', async () => {
+  const confirm = vi.fn()
+  await render({ pool: ['trend_follow'], onConfirm: confirm })
+  act(() => deleteBtn('趋势跟随').click())
+  const confirmBtn = [...confirmDialog()!.querySelectorAll('button')].find(b => b.textContent?.includes('确认删除'))!
+  await act(async () => { confirmBtn.click() })
+  // 删除后该 id 已从草稿池摘除
+  expect(selected().textContent).not.toContain('趋势跟随')
+  act(() => button('保存策略池').click())
+  expect(confirm).toHaveBeenCalledWith([])
+})
+
+it('surfaces the backend reason when deletion is refused', async () => {
+  mockStrategyDelete.mockRejectedValueOnce(new Error('该策略被叠加策略 [mix] 引用，请先解除引用后再删除'))
+  await render({ pool: [], onConfirm: () => {} })
+  act(() => deleteBtn('趋势跟随').click())
+  const confirmBtn = [...confirmDialog()!.querySelectorAll('button')].find(b => b.textContent?.includes('确认删除'))!
+  await act(async () => { confirmBtn.click() })
+  // 失败时确认框保持打开, 并显示后端原因
+  expect(confirmDialog()).toBeTruthy()
+  expect(confirmDialog()!.textContent).toContain('被叠加策略')
 })

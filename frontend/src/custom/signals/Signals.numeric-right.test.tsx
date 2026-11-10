@@ -81,7 +81,11 @@ it('信号库页: 数字右值条件不再触发错误边界, 正常渲染', asy
       <Signals />
     </ExtensionBoundary>,
   )
-  await new Promise(r => setTimeout(r, 120))
+  // 轮询等待数据渲染完成 (不用固定 sleep: 全量并行跑时机器负载高, 固定 120ms 往往不够)
+  for (let i = 0; i < 100; i += 1) {
+    await new Promise(r => setTimeout(r, 20))
+    if (container!.textContent?.includes('残月入场')) break
+  }
   expect(container!.textContent).not.toContain('暂时不可用')
   expect(container!.textContent).toContain('信号库')
   // 数字右值条件正常显示 (不再因 .startsWith 崩溃)

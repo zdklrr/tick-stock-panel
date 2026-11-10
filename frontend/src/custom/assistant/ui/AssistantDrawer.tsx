@@ -82,8 +82,12 @@ function saveWidth(width: number) {
 
 function clampWidth(width: number): number {
   // 右缘贴齐, 至少给页面主体留 64px 上下文。
-  const maxWidth = Math.max(MIN_WIDTH, window.innerWidth - 64)
-  return Math.min(Math.max(width, MIN_WIDTH), maxWidth)
+  // 窄屏(手机)下视口本身比 MIN_WIDTH 还窄: 此时必须放开下限让抽屉贴合视口,
+  // 否则「右缘贴齐 + 固定宽度」会让左侧内容溢出到屏幕外被裁切。
+  const viewport = window.innerWidth
+  const minWidth = Math.min(MIN_WIDTH, viewport)
+  const maxWidth = Math.max(minWidth, viewport - 64)
+  return Math.min(Math.max(width, minWidth), maxWidth)
 }
 
 export function AssistantDrawer() {

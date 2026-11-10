@@ -47,7 +47,7 @@ SOURCE_LABELS = {
     "strategy": "策略", "signal": "信号", "price": "价格",
     "market": "异动", "ladder": "连板梯队", "sector": "板块",
     "volume_delta": "放量", "abnormal": "异动", "date": "日期提醒",
-    "paper": "模拟盘",
+    "paper": "模拟盘", "risk": "风险提示",
 }
 
 # final 定版确认容差: 快照时间戳允许早于边界 5s 内 (供应商时间戳精度不一)
@@ -230,6 +230,38 @@ def _monitor_name_map(repo) -> dict[str, str]:
     避免每轮监控对 ~7000 行维表 iter_rows 重建。过滤空名称与旧行为一致。
     """
     return {s: n for s, n in repo.get_name_map().items() if n}
+
+
+def _enrich_paper_alert_names(events: list[dict], name_map: dict[str, str]) -> None:
+    """就地给模拟盘事件回填股票名称, 并把自动跟单文案重建成自解释版本。
+
+    两个来源本身没有维表访问权, 推送前必须在此统一补齐, 否则 toast / 语音 /
+    alert_store 留痕 / webhook 四条通道看到的都是裸代码:
+    - paper_fill (paper.py 生成): name 写死 "", 文案只有 symbol;
+    - auto_order (paper_auto 生成): 只有 arule id, 看不出「谁触发、买什么」。
+    """
+    if not events:
+        return
+    from app.strategy import paper_auto
+    for ev in events:
+        if ev.get("source") != "paper":
+            continue
+        symbol = str(ev.get("symbol") or "")
+        name = str(ev.get("name") or "").strip()
+        if not name:
+            name = str(name_map.get(symbol) or "").strip() if name_map else ""
+            if name:
+                ev["name"] = name
+        etype = ev.get("type")
+        if etype == "auto_order":
+            # name 已回填 → 重建 message, 让「股票名称 + 规则名 + 触发原因」一次讲清。
+            ev["message"] = paper_auto.format_auto_order_message(ev)
+        elif name and symbol:
+            # 成交/计划事件文案由 paper.py / paper_plans.py 拼 (本域只读):
+            # 含裸代码时就地替换成「名称(代码)」, 无需上游改动。
+            message = str(ev.get("message") or "")
+            if symbol in message and f"{name}({symbol})" not in message:
+                ev["message"] = message.replace(symbol, f"{name}({symbol})", 1)
 
 
 class QuoteService:
@@ -713,6 +745,17 @@ class QuoteService:
                                     logger.warning("%s 最终行情同步失败, 将继续重试", label)
                     else:
                         logger.debug("非轮询阶段(%s), 跳过行情轮询", phase)
+
+                    # 风险提示: 外围风险雷达 / 盘前简报 / 大盘状态换档时主动提示人。
+                    # 取数要联网 1~4s, 因此丢到专用单线程池 (_busy 保证不并发),
+                    # 并接受 120s 的节流 —— 绝不能拖慢本线程的行情轮询与模拟盘撮合。
+                    if self._app_state is not None:
+                        try:
+                            from app.services import risk_alert
+
+                            risk_alert.schedule(self._app_state.repo.store.data_dir, self)
+                        except Exception as e:  # noqa: BLE001 — 提示失败不影响行情
+                            logger.debug("风险提示调度失败: %s", e)
             except Exception as e:  # noqa: BLE001
                 logger.warning("行情轮询异常: %s", e)
 
@@ -1436,7 +1479,7 @@ class QuoteService:
             if stock_ready and self._app_state is not None:
                 try:
                     from app.strategy import paper as paper_trading
-                    from app.strategy import paper_auto
+                    from app.strategy import paper_auto, paper_plans
                     data_dir = self._app_state.repo.store.data_dir
                     snapshot = dict(zip(
                         enriched_today["symbol"].to_list(),
@@ -1444,17 +1487,36 @@ class QuoteService:
                         strict=False,
                     ))
                     paper_events: list[dict] = []
+                    # 名称映射: enriched 已 drop name 列, 走维表 memo 建 symbol→name,
+                    # 供下面统一回填 (成交/跟单/计划事件都只带裸代码)。
+                    try:
+                        paper_name_map = _monitor_name_map(self._app_state.repo)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("模拟盘 name_map 构建失败 (不影响推送): %s", e)
+                        paper_name_map = {}
                     for acc_id in paper_trading.list_account_ids(data_dir):
+                        acc = paper_trading.get_account(data_dir, acc_id) or {}
+                        acc_name = str(acc.get("name") or acc_id)
+                        # 交易计划先跑: 计划触发出来的 market 单必须在同一轮被下面的
+                        # evaluate_intraday 撮合, 否则要等下一次轮询 (盘中可能几分钟)。
+                        try:
+                            paper_events.extend(
+                                paper_plans.evaluate_plans(data_dir, snapshot, account_id=acc_id))
+                        except Exception as e:  # noqa: BLE001 — 计划失败不阻断撮合/跟单
+                            logger.warning("交易计划触发失败 account=%s: %s", acc_id, e)
                         paper_events.extend(
                             paper_trading.evaluate_intraday(data_dir, snapshot, account_id=acc_id))
                         feed = rule_events + paper_watch_events
                         if feed:
                             created = paper_auto.on_rule_events(data_dir, feed, account_id=acc_id)
-                            paper_events.extend(paper_auto.auto_order_events(created, account_id=acc_id))
+                            paper_events.extend(paper_auto.auto_order_events(
+                                created, account_id=acc_id, account_name=acc_name))
                     # 成交/自动跟单下单推送 (V3): 复用监控中心既有管道 —— SSE toast /
                     # 语音 (前端按 source 拼文案) / 系统通知 / alert_store 留痕 /
                     # Webhook。全部静默降级。
                     if paper_events:
+                        # 推送前统一补名称 + 重建自动跟单文案 (四条通道共用同一份事件)。
+                        _enrich_paper_alert_names(paper_events, paper_name_map)
                         self._broadcast_alerts(paper_events)
                         try:
                             from app.services import alert_store

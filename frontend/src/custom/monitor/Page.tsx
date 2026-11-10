@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
-import { AlertTriangle, RadioTower, Plus, Trash2, Settings2, Zap, Bell, ListChecks, BellRing, TrendingUp, TrendingDown, Flame, Tags } from 'lucide-react'
+import { AlertTriangle, RadioTower, Plus, Trash2, Settings2, Zap, Bell, ListChecks, BellRing, TrendingUp, TrendingDown, Flame, Tags, Eye, EyeOff } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { ErrorState } from '@/components/ErrorState'
@@ -23,10 +23,11 @@ import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { toNavItems, type NavItem } from '@/lib/listNav'
 import { DimensionMembersDialog, type DimensionKind, type DimensionMembersTarget } from '@/components/DimensionMembersDialog'
 import { usePreferences, useQuoteStatus } from '@/lib/useSharedQueries'
+import { useMonitorNoise, filterNoiseAlerts, isNoiseAlert, type MonitorNoisePref } from '@/lib/storage'
 
 const TYPE_LABEL: Record<string, string> = {
   signal: '信号', price: '价格/涨跌', market: '市场异动', strategy: '策略监控', sector: '板块监控',
-  abnormal: '异动监控', volume_delta: '轮询放量', date: '日期提醒',
+  abnormal: '异动监控', volume_delta: '轮询放量', date: '日期提醒', paper: '模拟盘',
 }
 
 /** 严重级别 → 左侧色条 + 图标 */
@@ -44,14 +45,78 @@ const SOURCE_BADGE_STYLE: Record<string, string> = {
   abnormal: 'bg-orange-500/10 text-orange-500 border-orange-500/20 dark:text-orange-400',
   volume_delta: 'bg-rose-500/10 text-rose-400 border-rose-500/20 dark:text-rose-300',
   date:     'bg-violet-500/10 text-violet-500 border-violet-500/20 dark:text-violet-300',
+  paper:    'bg-sky-400/10 text-sky-500 border-sky-400/20 dark:text-sky-300',
+  risk:     'bg-danger/10 text-danger border-danger/20',
 }
+
+/** 模拟盘事件 (source=paper) 的二级标签: 自动跟单/成交/交易计划, 比进程名更有信息量。 */
+const PAPER_TYPE_LABEL: Record<string, string> = {
+  auto_order: '自动跟单',
+  fill: '成交',
+  paper_fill: '成交',
+  plan_buy: '计划买入',
+  plan_sell: '计划卖出',
+}
+
+/** 噪音开关的显示名 (页头小字 / 开关按钮共用) */
+const NOISE_LABEL = {
+  hideAutoOrder: '自动跟单',
+  hideFill: '成交',
+} as const
+
+/** 已隐藏项的可读描述, 如「已隐藏 自动跟单 · 在开关里可改」; 无隐藏返回空串 */
+function noiseSummary(pref: MonitorNoisePref): string {
+  const parts: string[] = []
+  if (pref.hideAutoOrder) parts.push(NOISE_LABEL.hideAutoOrder)
+  if (pref.hideFill) parts.push(NOISE_LABEL.hideFill)
+  return parts.length === 0 ? '' : `已隐藏 ${parts.join('、')} · 点开关可改`
+}
+
+/**
+ * 页头右侧的噪音开关 — 一键隐藏「自动跟单 / 成交」这两类模拟盘刷屏事件。
+ * 偏好写 localStorage (跨刷新生效), 看板监控小组件与全局弹窗共用同一份。
+ */
+function MonitorNoiseToggle({ pref, onChange }: {
+  pref: MonitorNoisePref
+  onChange: (next: Partial<MonitorNoisePref>) => void
+}) {
+  return (
+    <div className="flex items-center gap-1">
+      <span className="mr-0.5 whitespace-nowrap text-[10px] text-muted">隐藏</span>
+      {([
+        { key: 'hideAutoOrder' as const, label: '自动跟单' },
+        { key: 'hideFill' as const, label: '成交' },
+      ]).map(it => {
+        const hidden = pref[it.key]
+        return (
+          <button
+            key={it.key}
+            onClick={() => onChange(it.key === 'hideAutoOrder' ? { hideAutoOrder: !hidden } : { hideFill: !hidden })}
+            title={hidden ? `已隐藏「${it.label}」事件, 点击重新显示` : `正在显示「${it.label}」事件, 点击隐藏`}
+            className={cn(
+              'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium transition-colors cursor-pointer',
+              hidden
+                ? 'border-sky-400/30 bg-sky-400/10 text-sky-500 dark:text-sky-300'
+                : 'border-border/60 bg-surface text-muted hover:border-accent/40 hover:text-accent',
+            )}
+          >
+            {hidden ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+            {it.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 
 /**
  * 渲染策略类消息 — 策略名黄色、进入红/移出绿 (A 股红涨绿跌惯例)、其余白色。
  */
 function renderMessage(source: string, message: string) {
   if (source !== 'strategy') {
-    return <span className="text-secondary">{message}</span>
+    // 模拟盘事件文案较长 (名称 + 规则名 + 触发原因 + 成交方式), 允许换行避免被裁掉
+    return <span className={source === 'paper' ? 'text-secondary break-words' : 'text-secondary'}>{message}</span>
   }
   const m = message.match(/^(策略「)([^」]+)(」)(新入选|进入|移出)( .*)$/)
   if (!m) return <span className="text-foreground">{message}</span>
@@ -137,9 +202,11 @@ export function Monitor() {
   }, [searchParams, setSearchParams])
 
   // 触发记录: 过滤 + 统计 (提升到主组件, 供 header 行使用)
-  const [filter, setFilter] = useState<'all' | 'strategy' | 'signal' | 'price' | 'market' | 'sector' | 'abnormal' | 'volume_delta' | 'date'>('all')
+  const [filter, setFilter] = useState<'all' | 'strategy' | 'paper' | 'signal' | 'price' | 'market' | 'sector' | 'abnormal' | 'volume_delta' | 'date'>('all')
   const [confirmClear, setConfirmClear] = useState(false)
   const [confirmClearRules, setConfirmClearRules] = useState(false)
+  // 噪音过滤: 隐藏模拟盘自动跟单/成交 (默认只隐自动跟单), 偏好持久化且三处共用
+  const [noisePref, setNoisePref] = useMonitorNoise()
 
   // 全局 ext 字段配置 (监控中心个股通知带行业/概念标签)
   const { data: prefs } = usePreferences()
@@ -170,6 +237,17 @@ export function Monitor() {
     },
   })
   const total = alertsQuery.data?.total ?? 0
+  // 噪音过滤 (自动跟单/成交): 列表、页头计数提示都以过滤后为准, 策略/信号永不隐藏
+  const loadedEvents: AlertEvent[] = useMemo(
+    () => ((alertsQuery.data as any)?.alerts ?? []) as AlertEvent[],
+    [alertsQuery.data],
+  )
+  const hiddenCount = useMemo(
+    () => loadedEvents.reduce((n, ev) => n + (isNoiseAlert(ev, noisePref) ? 1 : 0), 0),
+    [loadedEvents, noisePref],
+  )
+  const visibleCount = loadedEvents.length - hiddenCount
+  const noiseHint = noiseSummary(noisePref)
 
   // 规则个数
   const rulesQuery = useQuery({ queryKey: QK.monitorRules, queryFn: api.monitorRulesList })
@@ -199,7 +277,11 @@ export function Monitor() {
 
   return (
     <div className="flex flex-col h-full">
-      <PageHeader title="监控中心" subtitle="实时信号与规则管理" />
+      <PageHeader
+        title="监控中心"
+        subtitle={noiseHint || '实时信号与规则管理'}
+        right={<MonitorNoiseToggle pref={noisePref} onChange={setNoisePref} />}
+      />
       {realtimeUnavailable && (
         <div className="px-5 pb-1">
           <div className="mx-auto flex max-w-7xl items-center gap-2.5 rounded-xl border border-warning/30 bg-warning/[0.06] px-4 py-2.5">
@@ -224,7 +306,7 @@ export function Monitor() {
               <SectionHeader icon={BellRing} title="触发记录" />
               {/* 过滤标签 — 单行横向滚动, 不折行 (缩放/窄窗口下保持一行) */}
               <div className="flex min-w-0 flex-nowrap items-center gap-0.5 overflow-x-auto [&>button]:shrink-0">
-                {(['all', 'strategy', 'signal', 'price', 'market', 'sector', 'abnormal', 'volume_delta', 'date'] as const).map(f => (
+                {(['all', 'strategy', 'paper', 'signal', 'price', 'market', 'sector', 'abnormal', 'volume_delta', 'date'] as const).map(f => (
                   <button
                     key={f}
                     onClick={() => setFilter(f)}
@@ -249,7 +331,15 @@ export function Monitor() {
                 >
                   <Tags className="h-3.5 w-3.5" />
                 </button>
-                <span className="rounded-md bg-elevated/50 px-1.5 py-0.5 text-[10px] font-medium text-muted">{total}</span>
+                <span
+                  className="rounded-md bg-elevated/50 px-1.5 py-0.5 text-[10px] font-medium text-muted"
+                  title={hiddenCount > 0 ? `当前显示 ${visibleCount} 条 · 已隐藏 ${hiddenCount} 条 · 记录总数 ${total}` : `记录总数 ${total}`}
+                >
+                  {visibleCount}
+                </span>
+                {hiddenCount > 0 && (
+                  <span className="whitespace-nowrap text-[10px] text-muted">已隐藏 {hiddenCount} 条</span>
+                )}
                 {total > 0 && (
                   <button
                     onClick={() => setConfirmClear(true)}
@@ -261,7 +351,7 @@ export function Monitor() {
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-auto p-3.5">
-              <AlertsList alertsQuery={alertsQuery} confirmClear={confirmClear} setConfirmClear={setConfirmClear} total={total} enterTs={enterTsRef.current} monitorExtFields={monitorExtFields} />
+              <AlertsList alertsQuery={alertsQuery} confirmClear={confirmClear} setConfirmClear={setConfirmClear} total={total} enterTs={enterTsRef.current} monitorExtFields={monitorExtFields} noisePref={noisePref} onShowAllNoise={() => setNoisePref({ hideAutoOrder: false, hideFill: false })} />
             </div>
           </section>
 
@@ -335,13 +425,15 @@ function SectionHeader({ icon: Icon, title }: { icon: any; title: string }) {
 }
 
 // ── 触发记录列表 ──────────────────────────────────────
-function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs, monitorExtFields }: {
+function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs, monitorExtFields, noisePref, onShowAllNoise }: {
   alertsQuery: ReturnType<typeof useQuery>
   confirmClear: boolean
   setConfirmClear: (v: boolean) => void
   total: number
   enterTs: number
   monitorExtFields: { concept: MonitorExtFieldItem | null; industry: MonitorExtFieldItem | null }
+  noisePref: MonitorNoisePref
+  onShowAllNoise: () => void
 }) {
   const qc = useQueryClient()
   const navigate = useNavigate()
@@ -377,11 +469,15 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
     }
   }
 
-  const events = (alertsQuery.data as any)?.alerts ?? []
+  const allEvents = (alertsQuery.data as any)?.alerts ?? []
+  // 噪音过滤: 隐藏「自动跟单/成交」后, 策略与信号类记录保持原样
+  const events = useMemo(() => filterNoiseAlerts(allEvents as AlertEvent[], noisePref), [allEvents, noisePref])
+  const hiddenCount = allEvents.length - events.length
+  const noiseHint = noiseSummary(noisePref)
 
   // 切股导航列表: 有 symbol 的触发记录 (按展示顺序)
   const alertsNavItems = useMemo(
-    () => toNavItems(events.filter((ev: AlertEvent) => ev.symbol)),
+    () => toNavItems(events.filter((ev): ev is AlertEvent & { symbol: string } => !!ev.symbol)),
     [events],
   )
   const handlePreviewEvent = useCallback((ev: AlertEvent) => {
@@ -411,11 +507,30 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
           onRetry={() => alertsQuery.refetch()}
         />
       ) : events.length === 0 ? (
-        <EmptyState
-          icon={Bell}
-          title="暂无触发记录"
-          hint="监控规则命中后,触发记录会出现在这里。可在右侧配置规则,或在标的详情页加入监控。"
-        />
+        allEvents.length > 0 ? (
+          // 记录非空但全被噪音开关隐藏 → 告诉用户「不是没数据, 是过滤了」并给一键恢复
+          <div className="grid place-items-center px-8 py-16">
+            <div className="max-w-md text-center">
+              <EyeOff className="mx-auto h-10 w-10 text-muted" strokeWidth={1.5} />
+              <h2 className="mt-4 text-[16px] leading-6 font-medium text-foreground">已隐藏模拟盘噪音记录</h2>
+              <p className="mt-2 text-sm leading-relaxed text-secondary">
+                当前共 {hiddenCount} 条记录被隐藏（{noiseHint || '自动跟单/成交'}）。
+              </p>
+              <button
+                onClick={onShowAllNoise}
+                className="mt-3 inline-flex items-center gap-1 rounded-md border border-border/60 bg-surface px-2.5 py-1 text-[11px] text-muted transition-colors hover:border-accent/40 hover:text-accent cursor-pointer"
+              >
+                <Eye className="h-3 w-3" />显示全部记录
+              </button>
+            </div>
+          </div>
+        ) : (
+          <EmptyState
+            icon={Bell}
+            title="暂无触发记录"
+            hint="监控规则命中后,触发记录会出现在这里。可在右侧配置规则,或在标的详情页加入监控。"
+          />
+        )
       ) : (
         <div className="space-y-2">
               {events.map((ev: any, i: number) => {
@@ -558,6 +673,8 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
                         )}
                         <span className={cn('rounded border px-1.5 py-0.5 text-[9px] font-medium', SOURCE_BADGE_STYLE[ev.source] ?? 'bg-elevated text-muted border-border')}>
                           {(() => {
+                            // 模拟盘: 「自动跟单 / 成交 / 计划买入」比进程名有信息量
+                            if (ev.source === 'paper') return PAPER_TYPE_LABEL[ev.type] ?? '模拟盘'
                             // 优先用规则名 (如 "策略监控 · 空中加油" → "空中加油"); 退回到 type 标签
                             const rn = ev.rule_name ?? ''
                             const dotIdx = rn.indexOf(' · ')
@@ -565,6 +682,10 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
                           })()}
                         </span>
                       </div>
+                      {/* 账户名 (多账户时区分是哪个模拟盘触发的) */}
+                      {ev.source === 'paper' && ev.account_name && (
+                        <div className="mt-0.5 pl-0.5 text-[10px] text-muted">{ev.account_name}</div>
+                      )}
                       {/* 详情行: 实际命中信号为主 (有 signals 时); 无 truth 命中则回退条件摘要 */}
                       {ev.signals && ev.signals.length > 0 ? (
                         <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px]">

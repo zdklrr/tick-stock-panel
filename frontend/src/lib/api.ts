@@ -617,6 +617,201 @@ export interface RegimeCoverage {
   latest_date: string | null
 }
 
+// ── 风险雷达 / 盘前简报 ──
+// 单位口径 (硬约定, 改后端必须同步这里):
+//   chg_pct / ma20_pct / gap_pct / amplitude / drawdown_pct 都是**百分数数值**
+//     (-0.83 表示 -0.83%, 不是 -0.0083)
+//   score 0~100 分 (50=中性, 越高越危险)
+//   exposure / factor 是**仓位系数** 0.35~1.10 (不是百分比)
+//   breadth.dn_ratio 是 0~1 小数 (0.1466 = 14.66% 在跌)
+//   probs 是 0~100 百分数, 三者相加 = 100
+//   signal 是合成信号原值 (量纲同百分数, 但不要当百分比渲染)
+export type RiskLevel = 'low' | 'normal' | 'elevated' | 'high' | 'unknown'
+export type RiskRegionKey = 'us' | 'asia' | 'hk'
+
+export interface RiskIndex {
+  code: string
+  name: string
+  region: RiskRegionKey
+  /** 最新点位; 取数失败/过期时为 null */
+  price: number | null
+  /** 当日涨跌幅, **百分数数值** (-1.07 = -1.07%) */
+  chg_pct: number | null
+  /** 相对 20 日均线偏离, **百分数数值** */
+  ma20_pct: number | null
+  /** 单只风险分 0~100 (越高越危险) */
+  score: number | null
+  as_of: string | null
+  /** 数据源日期超过 4 天被丢弃 → 视为缺失, UI 应标灰而不是画 0 */
+  stale: boolean
+  source: string
+}
+
+export interface RiskRegion {
+  /** 区域风险分 0~100; 该区域全部取数失败时为 null */
+  score: number | null
+  /** 区域仓位系数 0.35~1.10; 同上可能为 null */
+  exposure: number | null
+}
+
+export interface RiskBreadth {
+  ok: boolean
+  /** 宽度风险分 0~100 (越高越危险) */
+  score: number | null
+  /** 0~1 小数: 0.1466 表示 14.66% 的股票在跌 */
+  dn_ratio: number | null
+  up: number
+  down: number
+  total: number
+}
+
+export interface RiskEquity {
+  ok: boolean
+  /** 账户回撤系数 0.20~1.00 (无净值历史时为 1.0) */
+  factor: number
+  /** 窗口内当前回撤, **百分数数值**; 无净值历史时为 null */
+  drawdown_pct: number | null
+  window_days: number
+}
+
+export interface RiskRadar {
+  ok: boolean
+  /** 综合风险分 0~100 */
+  score: number | null
+  level: RiskLevel
+  level_text: string
+  /** 合成仓位系数 0.35~1.10 (外围 × 账户回撤) */
+  exposure: number
+  /** 仅外围的仓位系数 (不含账户回撤) */
+  global_exposure: number | null
+  regions: Partial<Record<RiskRegionKey, RiskRegion>>
+  indexes: RiskIndex[]
+  breadth: RiskBreadth
+  equity: RiskEquity
+  /** 未取到数据的指数代码, 例如 ["N225","KS11"] */
+  missing: string[]
+  advice: string
+  fetched_at: string
+  /**
+   * **数据日期** (外围行情对应的那一天, "YYYY-MM-DD"), 不是抓取时刻。
+   * 后端取所有**未过期**指数里最新的那个日期; 全部缺失时为 null。
+   */
+  as_of?: string | null
+  /** as_of 距今天的天数; as_of 为 null 时为 null */
+  stale_days?: number | null
+}
+
+export type PremarketBias = 'bull' | 'flat' | 'bear'
+export type PremarketStrength = 'strong' | 'mid' | 'weak'
+
+export interface PremarketRow {
+  code: string
+  name: string
+  /** **百分数数值** */
+  chg_pct: number | null
+  /** 该指数的数据日期 "YYYY-MM-DD"; 缺失时为 null */
+  as_of?: string | null
+}
+
+export interface Premarket {
+  ok: boolean
+  bias: string
+  bias_key: PremarketBias
+  strength: string
+  strength_key: PremarketStrength
+  /** 0~100 百分数, 三者相加 = 100 */
+  probs: { up: number, flat: number, down: number }
+  /** 开盘缺口区间, **百分数数值** */
+  gap_pct: { low: number, high: number }
+  /** 预计振幅, **百分数数值** */
+  amplitude: number
+  /** 合成信号原值 */
+  signal: number
+  /**
+   * **数据日期** ("YYYY-MM-DD") —— 盘前简报是「下一交易日的开盘预判」,
+   * 所以顶层 as_of = 这一天 (通常是今天)。各驱动源的实际数据日期见下面的子字段。
+   */
+  as_of?: string | null
+  a50: { price: number | null, chg_pct: number | null, as_of?: string | null } | null
+  us: { chg_pct: number | null, rows: PremarketRow[], as_of?: string | null } | null
+  asia: { chg_pct: number | null, rows: PremarketRow[], as_of?: string | null } | null
+  cnh: { price: number | null, chg_pct: number | null, note: string, as_of?: string | null } | null
+  drivers: string[]
+  advice: string
+}
+
+// ── 大盘择时 (沪深300 收盘 vs MA20/MA60, zdk 口径) ──
+export type TrendState = 'risk_on' | 'weak' | 'risk_off' | 'unknown'
+
+export interface RiskTiming {
+  ok: boolean
+  /** 实际取数的标的代码 */
+  symbol: string
+  /** 最后一根日K 的日期, 例如 "2026-10-30"; 无数据为 null */
+  as_of: string | null
+  close: number | null
+  ma20: number | null
+  ma60: number | null
+  /** 收盘 vs MA20, **百分数数值** */
+  pct_vs_ma20: number | null
+  /** 收盘 vs MA60, **百分数数值** */
+  pct_vs_ma60: number | null
+  state: TrendState
+  state_label: string
+  /** 择时仓位系数 0~1 */
+  exposure: number
+  /** 参与计算的日K 根数 */
+  bars: number
+  /** as_of 落后应有交易日的天数 (按交易日算, 周末不虚报) */
+  stale_days: number | null
+  /** 日K 滞后超过 4 天时为 true, 前端需明示 */
+  stale: boolean
+  /** as_of 是否是当日**未定型**的盘中K (交易时段内、收盘定型前) */
+  intraday?: boolean
+  advice: string
+}
+
+/** 综合建议仓位的一路因子 */
+export interface RiskAdvicePart {
+  key: 'timing' | 'phase' | 'risk'
+  label: string
+  /** 该路系数: 0~1.2 */
+  value: number
+  /** true = 这一路取数缺失, 按 1.0 中性参与, 不能被当成 0 */
+  missing: boolean
+  state: string | null
+  state_label: string | null
+  detail: string
+}
+
+export interface RiskAdvicePaper {
+  active_plans: number
+  last_adj: number | null
+  last_adj_reason: string | null
+  timing_scale: number | null
+  note: string
+}
+
+export interface RiskAdvice {
+  ok: boolean
+  /** 合成后建议仓位系数, 夹在 0.15~1.20 */
+  suggested_exposure: number
+  /** 同一数值的百分比口径, 例如 26.7 表示 26.7% */
+  suggested_exposure_pct: number
+  label: string
+  advice: string
+  parts: { timing: RiskAdvicePart, phase: RiskAdvicePart, risk: RiskAdvicePart }
+  detail: {
+    raw: number
+    /** true = 乘积超出 [0.15, 1.20] 被夹过 */
+    clamped: boolean
+    floor: number
+    cap: number
+    paper: RiskAdvicePaper
+    timing: RiskTiming
+  }
+}
+
 // ── 市场阶段(情绪周期) 与 主线 ──
 export type MarketPhase = 'ice' | 'ignite' | 'rally' | 'climax' | 'ebb' | 'repair'
 
@@ -1195,6 +1390,9 @@ export interface PaperCompareRow {
   live_total?: number | null
   live_pnl_pct?: number | null
   estimating?: boolean
+  /** v0.3.46: 今日盈亏 (金额/比例), 无定版净值且无昨收时为 null */
+  day_pnl?: number | null
+  day_pnl_pct?: number | null
 }
 
 /** FIFO 配对回合 (GET /api/paper/rounds): 开仓成本含买入费, 平仓净额扣卖出费 */
@@ -1220,10 +1418,14 @@ export interface PaperArenaSource {
   cooldown_days?: number
   /** 最大同时持仓标的数 (0 = 不限); 对齐回测 max_positions 口径 */
   max_positions?: number
+  /** 仓位分配: fixed=每票固定% / equal_total=总仓均分(建议总仓÷实际只数) */
+  position_mode?: 'fixed' | 'equal_total'
 }
 
 export interface PaperHolding {
   symbol: string
+  /** 股票名称快照(下单/成交时落盘); 维表残缺时为 null, 前端只显示代码 */
+  name?: string | null
   asset_type: string
   qty: number
   avg_cost: number
@@ -1232,6 +1434,21 @@ export interface PaperHolding {
   pnl: number
   pnl_pct: number
   available_qty: number
+  // v0.3.46: 日线估值口径字段(非交易时段也给出浮盈与今日盈亏)
+  price_date?: string | null
+  priced?: boolean
+  prev_close?: number | null
+  day_pnl?: number | null
+  day_pnl_pct?: number | null
+  // v0.3.34: 持仓扩列字段(全部可选, 后端缺失时前端降级为 --)
+  position_pct?: number
+  plan_stop_loss?: number | null
+  plan_target1?: number | null
+  plan_target2?: number | null
+  plan_entry_mode?: string | null
+  plan_source?: string | null
+  plan_entry_low?: number | null
+  plan_entry_high?: number | null
 }
 
 export interface PaperNavItem {
@@ -1254,6 +1471,12 @@ export interface PaperOverview {
   total_pnl?: number
   initial_cash?: number
   estimating?: boolean
+  /** v0.3.46: 今日盈亏(金额/比例)。优先「当前总资产 − 上一交易日定版净值」,
+   *  无定版净值时退回持仓浮动日盈亏之和; 都不可用时为 null(前端不显示)。 */
+  day_pnl?: number | null
+  day_pnl_pct?: number | null
+  /** v0.3.46: 估值口径来源 live(盘中实时) / daily(最近日线收盘) / cost(成本价降级) */
+  price_source?: 'live' | 'daily' | 'cost'
   holdings?: PaperHolding[]
   fees?: { commission_pct: number; stamp_tax_pct: number; slippage_bps: number }
 }
@@ -1289,6 +1512,8 @@ export interface PaperAutoRule {
   cooldown_days: number
   /** 最大同时持仓标的数 (仅约束买入开新仓, 0 = 不限); 对齐回测 max_positions 口径 */
   max_positions?: number
+  /** 仓位分配: fixed=每票固定% / equal_total=总仓均分(建议总仓÷实际只数) */
+  position_mode?: 'fixed' | 'equal_total'
   enabled: boolean
   created_at: string
 }
@@ -1308,6 +1533,302 @@ export interface PaperFill {
   factor?: number
   qty_before?: number
   cost_before?: number
+}
+
+// ===== 模拟盘交易计划 (paper plans) =====
+// 口径: 策略给出买入价格区间/止损/止盈/仓位, 由后端定时撮合自动触发买卖;
+// 金额类字段 (risk_amount/gain_at_t1/gain_at_t2/loss_at_stop) 一律为正数,
+// 亏损方向由 UI 自己加 '-' 前缀, 不要依赖后端符号。
+export type PaperPlanStatus = 'pending' | 'bought' | 'holding' | 'closed' | 'expired' | 'cancelled'
+
+export interface PaperPlan {
+  id: string
+  account_id?: string
+  symbol: string
+  name?: string | null
+  status: PaperPlanStatus
+  /** 建计划时的参考价 (通常为策略结果行的收盘价) */
+  entry_ref?: number
+  entry_low: number
+  entry_high: number
+  stop?: number | null
+  stop_pct?: number | null
+  target1?: number | null
+  target2?: number | null
+  /** 目标1 成交后抬到保本的移动止损 */
+  trail_stop?: number | null
+  atr?: number | null
+  atr_pct?: number | null
+  pos_pct?: number | null
+  qty_planned?: number | null
+  qty_filled?: number | null
+  entry_price?: number | null
+  entry_date?: string | null
+  risk_amount?: number | null
+  gain_at_t1?: number | null
+  gain_at_t2?: number | null
+  loss_at_stop?: number | null
+  rr?: number | null
+  /** 大盘情绪缩放倍率 (已应用的 exposure) */
+  exposure?: number | null
+  state?: string | null
+  /** 仓位被 max_pos_pct 截断 */
+  capped?: boolean
+  /** 目标1 已减半 */
+  t1_done?: boolean
+  source?: string | null
+  note?: string | null
+  last_error?: string | null
+  /** 建计划时的大盘状态中文名 (如 "偏强") */
+  regime_label?: string | null
+  /** 建计划时冻结的大盘择时系数 */
+  timing_scale?: number | null
+  /** 最近一次下单实际应用的总系数 (大盘 × 外围 × 回撤) */
+  last_adj?: number | null
+  /** 总系数的中文说明, 如 "偏强×1.00 外围×0.75 回撤×1.00 → 0.75" */
+  last_adj_reason?: string | null
+  /** 最近 20 次系数调整记录 */
+  adj_history?: PaperPlanAdjRecord[]
+  /** 买入执行方式: zone=进区间才买 / next_open=次日开盘 / market=立即市价; 老计划缺省视为 zone */
+  entry_mode?: PaperPlanEntryMode
+  created_at: string
+  updated_at?: string | null
+}
+
+/** 计划买入执行方式 (后端 trade_plan.ENTRY_MODES; 缺省 zone) */
+export type PaperPlanEntryMode = 'zone' | 'next_open' | 'market'
+
+/** 计划面板里的系数调整历史项 */
+export interface PaperPlanAdjRecord {
+  at?: string | null
+  adj?: number | null
+  reason?: string | null
+}
+
+export interface PaperPlanCfg {
+  /** 单笔最大亏损占权益 % */
+  risk_budget_pct: number
+  max_pos_pct: number
+  min_pos_pct: number
+  atr_stop_mult: number
+  max_stop_pct: number
+  entry_zone_pct: number
+  target1_r: number
+  target2_r: number
+  max_hold_days: number
+  regime_scale_enabled: boolean
+  regime_stop_tighten_enabled: boolean
+  /** 人为闸门: 最多持仓只数, 0 = 不限 (默认, 仓位交给策略与风险) */
+  max_symbols?: number
+  /** 人为闸门: 总仓位上限 %, 100 = 不限 (默认) */
+  max_total_exposure_pct?: number
+  /** 策略→计划的默认买入执行方式 (zone/next_open/market) */
+  default_entry_mode?: PaperPlanEntryMode
+}
+
+export interface PaperRegimeState {
+  date?: string | null
+  state: string
+  label?: string | null
+  score?: number | null
+  /**
+   * 「优中选优」缩放口径 (后端 T14 上线后才有): 大盘择时系数 / 情绪周期系数 /
+   * 本期最多持仓只数。后端未返回时前端按 labels.exposure + TREND_EXPOSURE 自行推导。
+   */
+  timing_exposure?: number | null
+  phase_exposure?: number | null
+  holdings_limit?: number | null
+  /** 缩放前的只数上限 (cfg.max_symbols, 0=不限) */
+  max_symbols?: number | null
+  /** 本期计划仓位合计 % */
+  total_pos_pct?: number | null
+}
+
+/** GET /api/paper/plan_config 的 labels: state→中文名、仓位倍率表、止损收紧系数表 */
+export interface PaperPlanLabels {
+  state_labels: Record<string, string>
+  exposure: Record<string, number>
+  stop_k: Record<string, number>
+  /** 计划状态中文名 */
+  status_labels?: Record<string, string>
+  /** 两个人为闸门的字段说明 */
+  max_symbols?: string
+  max_total_exposure_pct?: string
+  /** 买入执行方式的可选值与中文名 (后端 trade_plan.ENTRY_MODES / ENTRY_MODE_LABELS) */
+  entry_modes?: PaperPlanEntryMode[]
+  entry_mode_labels?: Record<string, string>
+  default_entry_mode?: PaperPlanEntryMode
+}
+
+export interface PaperPlanListResponse {
+  plans: PaperPlan[]
+  total: number
+}
+
+export interface PaperPlanCreatePayload {
+  account_id?: string
+  symbol: string
+  entry_low: number
+  entry_high: number
+  stop?: number
+  target1?: number
+  target2?: number
+  pos_pct?: number
+  qty_planned?: number
+  /** 买入执行方式 (缺省 = 账户 cfg.default_entry_mode) */
+  entry_mode?: PaperPlanEntryMode
+  source?: string
+  note?: string
+}
+
+export interface PaperPlanFromStrategyPayload {
+  account_id?: string
+  strategy_id: string
+  params?: Record<string, unknown>
+  top_n?: number
+  cfg?: PaperPlanCfg
+  entry_mode?: PaperPlanEntryMode
+}
+
+export interface PaperPlanFromStrategyResponse {
+  ok: boolean
+  created: number
+  plans: PaperPlan[]
+  state: PaperRegimeState | null
+}
+
+export interface PaperPlanConfigResponse {
+  cfg: PaperPlanCfg
+  state: PaperRegimeState | null
+  labels: PaperPlanLabels
+  /** 「优中选优」只数缩放结果 (上限 → 本期最多几只), 后端算好 */
+  holdings?: PaperPlanHoldings
+  /** 大盘择时系数 (risk_on 1.0 / weak 0.65 / risk_off 0.35), 后端算好 */
+  timing?: PaperPlanTiming
+}
+
+/** 「优中选优」只数缩放口径 */
+export interface PaperPlanHoldings {
+  /** 本期最多持仓只数; null = 不限制 */
+  limit?: number | null
+  unlimited?: boolean
+  /** 缩放前的上限 (cfg.max_symbols, 0=不限) */
+  max_symbols?: number | null
+  /** 下限 (min_holdings) */
+  min_holdings?: number | null
+  timing_exposure?: number | null
+  phase_exposure?: number | null
+  /** 口径说明 (为什么是这个数) */
+  reason?: string | null
+}
+
+/** 大盘择时口径 (trend_timing, 只读本地不联网) */
+export interface PaperPlanTiming {
+  state?: string | null
+  label?: string | null
+  /** 择时仓位系数; 缺数据时后端按 1.0 (中性) 给 */
+  exposure?: number | null
+  ok?: boolean
+  as_of?: string | null
+  close?: number | null
+  ma20?: number | null
+  ma60?: number | null
+  pct_vs_ma20?: number | null
+  pct_vs_ma60?: number | null
+  stale_days?: number | null
+  stale?: boolean
+  error?: string | null
+}
+
+/** 单只标的的计划预览 (只算不落盘) */
+export interface PaperPlanPreview {
+  symbol: string
+  name?: string | null
+  entry_ref?: number | null
+  entry_low?: number | null
+  entry_high?: number | null
+  stop?: number | null
+  stop_pct?: number | null
+  target1?: number | null
+  target2?: number | null
+  atr?: number | null
+  atr_pct?: number | null
+  /** ATR 是估算的 (缺 ATR 数据时按 3% 波动率估) */
+  atr_estimated?: boolean
+  pos_pct?: number | null
+  qty_planned?: number | null
+  risk_amount?: number | null
+  gain_at_t1?: number | null
+  gain_at_t2?: number | null
+  rr?: number | null
+  entry_mode?: PaperPlanEntryMode
+  state?: string | null
+  exposure?: number | null
+  /** 仓位被 max_pos_pct 截断 */
+  capped?: boolean
+  /** 这只能不能生成计划 */
+  ok: boolean
+  /** ok=false 时的原因 (中文, 直接展示给用户) */
+  reason: string
+  /** ok=true 时的补充说明 (如「无 ATR 数据, 按 3% 波动率估算」) */
+  note: string
+}
+
+export interface PaperPlanPreviewResponse {
+  ok: boolean
+  previews: PaperPlanPreview[]
+  account_id: string
+  equity: number
+  cash?: number | null
+  market_value?: number | null
+  initial_cash?: number | null
+  account_name?: string | null
+  state: PaperRegimeState | null
+  entry_mode?: PaperPlanEntryMode
+  timing?: PaperPlanTiming
+  holdings?: PaperPlanHoldings
+  summary: {
+    total: number
+    /** 能生成计划的条数 */
+    ok: number
+    /** 生成不了的条数 (前端要明确告诉用户为什么) */
+    blocked: number
+    total_pos_pct: number
+    need_cash: number
+  }
+}
+
+/** 从「已经选出来的行」直接建计划: 只回传勾选的标的, 不重跑策略。 */
+export interface PaperPlanFromRowsPayload {
+  account_id?: string
+  /** 前端结果表里勾选的行 (至少 symbol, 其余 close/name/low/atr_14/score 有多少带多少) */
+  rows: Record<string, unknown>[]
+  cfg?: PaperPlanCfg
+  /** 优中选优: 按评分降序只取前 N 只 (后端 T14; 未上线时被忽略, 不报错) */
+  top_n?: number
+  /** 排序键, 默认 'score' (缺失该列时后端保持原顺序) */
+  rank_key?: string
+  rank_desc?: boolean
+  /** 买入执行方式 (缺省 = 账户 cfg.default_entry_mode) */
+  entry_mode?: PaperPlanEntryMode
+  source?: string
+}
+
+export interface PaperPlanSkip {
+  symbol: string
+  reason: string
+}
+
+export interface PaperPlanFromRowsResponse {
+  ok: boolean
+  created: number
+  plans: PaperPlan[]
+  /** 没建成的标的及原因 (同标的有活跃计划 / 股数不足一手) */
+  skipped: PaperPlanSkip[]
+  state: PaperRegimeState | null
+  /** 实际生效的买入执行方式 (后端回显) */
+  entry_mode?: PaperPlanEntryMode
+  source?: string
 }
 
 export interface VDBasicFilter {
@@ -1373,6 +1894,17 @@ export interface AlertEvent {
   abnormal_value?: number
   abnormal_threshold?: number
   abnormal_closeness?: number
+  /** 模拟盘事件 (source=paper) 附加字段 — 让 toast/语音/历史记录能自解释 */
+  side?: 'buy' | 'sell'
+  qty?: number
+  order_type?: 'market' | 'next_open' | 'close'
+  account_id?: string
+  account_name?: string
+  plan_id?: string
+  /** 自动跟单: 触发规则名 + 匹配目标 (跟策略 / 跟监控规则) + 触发原因 */
+  match_kind?: 'strategy' | 'rule'
+  match_id?: string
+  reason?: string
   /** ext 富化字段 (行业/概念等), 键为 "{configId}__{fieldName}" */
   [key: string]: unknown
 }
@@ -3601,6 +4133,29 @@ export const api = {
   },
   regimeMainlineRecompute: () =>
     request<{ ok: boolean; rows: number }>('/api/regime/mainline/recompute', { method: 'POST' }),
+
+  /** 风险雷达: 7 个环球指数 + A 股宽度 + 账户回撤 → 仓位系数。后端有 45s 缓存。 */
+  riskRadar: (account?: string, refresh = false) => {
+    const params = new URLSearchParams({ account: account || 'default' })
+    if (refresh) params.set('refresh', 'true')
+    return request<RiskRadar>(`/api/risk/radar?${params.toString()}`)
+  },
+  /** 盘前简报: A50 / 美股 / 亚太合成 → 开盘方向、缺口区间与三段概率。后端有 120s 缓存。 */
+  riskPremarket: (refresh = false) =>
+    request<Premarket>(`/api/risk/premarket${refresh ? '?refresh=true' : ''}`),
+  /** 清空两层缓存 (前端「重试」按钮用), 之后需要 invalidate QK.riskAll */
+  riskRefresh: () =>
+    request<{ ok: boolean, msg: string }>('/api/risk/refresh', { method: 'POST' }),
+  /** 大盘择时: 沪深300 收盘 vs MA20/MA60 判四态 (与情绪、风险雷达三个正交维度) */
+  riskTiming: (symbol?: string) => {
+    const qs = symbol ? `?symbol=${encodeURIComponent(symbol)}` : ''
+    return request<RiskTiming>(`/api/risk/timing${qs}`)
+  },
+  /** 综合建议仓位: 大盘择时 × 情绪周期 × 外围风险, 并列出每路系数 */
+  riskAdvice: (account?: string) => {
+    const qs = account ? `?account=${encodeURIComponent(account)}` : ''
+    return request<RiskAdvice>(`/api/risk/advice${qs}`)
+  },
   mainlineFilterUpdate: (payload: { min_members?: number; max_members?: number; blacklist?: string[]; exclude_st?: boolean }) =>
     request<MainlineFilter>('/api/settings/preferences/mainline-filter', {
       method: 'PUT',
@@ -4828,6 +5383,35 @@ export const api = {
   paperDeleteAccount: (force: boolean, account?: string) =>
     request<{ ok: boolean; deleted: string; holdings?: number; pending_orders?: number }>(accUrl(`/api/paper/account?force=${force}`, account), { method: 'DELETE' }),
 
+  /** 批量删除: 逐个删, 单个失败不阻断 (进 failed); force=true 连有持仓/待成交的也删 */
+  paperBatchDelete: (accountIds: string[], force = false) =>
+    request<{ ok: boolean; deleted: string[]; failed: Array<{ account: string; error: string }> }>('/api/paper/accounts/batch_delete', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: accountIds, force }),
+    }),
+
+  /** 批量启动/停止: frozen=停止 (撮合/跟单/结算全部暂停), active=启动 */
+  paperBatchStatus: (accountIds: string[], status: 'active' | 'frozen') =>
+    request<{ ok: boolean; updated: Array<{ account: string; status: string; name?: string }>; failed: Array<{ account: string; error: string }>; status: string }>('/api/paper/accounts/batch_status', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: accountIds, status }),
+    }),
+
+  /** 启动单个账户 (等价 freeze=false 的语义化别名) */
+  paperStartAccount: (account: string) =>
+    request<{ ok: boolean; account: PaperAccount }>(`/api/paper/accounts/${encodeURIComponent(account)}/start`, { method: 'POST' }),
+
+  /** 停止单个账户 (等价 freeze=true 的语义化别名) */
+  paperStopAccount: (account: string) =>
+    request<{ ok: boolean; account: PaperAccount }>(`/api/paper/accounts/${encodeURIComponent(account)}/stop`, { method: 'POST' }),
+
+  /** 重置账户: 清空订单/成交/持仓/净值/计划, 现金回初始资金 (不可恢复, 必须 confirm) */
+  paperResetAccount: (account?: string, opts?: { keep_rules?: boolean }) =>
+    request<{ ok: boolean; account: PaperAccount; cleared: Record<string, number> }>(
+      accUrl(`/api/paper/reset?confirm=true${opts?.keep_rules === false ? '&keep_rules=false' : ''}`, account),
+      { method: 'POST' },
+    ),
+
   paperAutoRules: (account?: string) =>
     request<{ rules: PaperAutoRule[] }>(accUrl('/api/paper/auto_rules', account)),
 
@@ -4848,6 +5432,64 @@ export const api = {
     request<{ created: Array<{ account: string; name: string; rule_id: string }> }>('/api/paper/arena/batch_create', {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+
+  // ===== Paper 交易计划 (买入区间/止损/止盈/仓位, 后端定时撮合自动触发) =====
+  paperPlans: (account?: string, status?: string) => {
+    const p = new URLSearchParams()
+    if (account) p.set('account_id', account)
+    if (status) p.set('status', status)
+    const q = p.toString()
+    return request<PaperPlanListResponse>(`/api/paper/plans${q ? `?${q}` : ''}`)
+  },
+
+  paperPlanCreate: (body: PaperPlanCreatePayload, account?: string) =>
+    request<{ ok: boolean; plan: PaperPlan }>('/api/paper/plans', {
+      method: 'POST',
+      body: JSON.stringify(account ? { ...body, account_id: account } : body),
+    }),
+
+  paperPlanDelete: (id: string, account?: string) => {
+    const p = new URLSearchParams()
+    if (account) p.set('account_id', account)
+    const q = p.toString()
+    return request<{ ok: boolean }>(`/api/paper/plans/${encodeURIComponent(id)}${q ? `?${q}` : ''}`, { method: 'DELETE' })
+  },
+
+  /** 跑策略 → 取前 top_n 行 → 按 close 价生成一批计划 (同步计算型, 放宽超时) */
+  paperPlansFromStrategy: (body: PaperPlanFromStrategyPayload, account?: string) =>
+    request<PaperPlanFromStrategyResponse>('/api/paper/plans/from_strategy', {
+      method: 'POST',
+      timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
+      body: JSON.stringify(account ? { ...body, account_id: account } : body),
+    }),
+
+  /** 用「当前已经选出来的行」直接建计划 (不重跑策略, 用户自己挑哪几只) */
+  paperPlansFromRows: (body: PaperPlanFromRowsPayload, account?: string) =>
+    request<PaperPlanFromRowsResponse>('/api/paper/plans/from_rows', {
+      method: 'POST',
+      body: JSON.stringify(account ? { ...body, account_id: account } : body),
+    }),
+
+  paperPlanConfig: (account?: string) =>
+    request<PaperPlanConfigResponse>(accUrl('/api/paper/plan_config', account)),
+
+  /**
+   * 只算不落盘: 把勾选的行变成「这只会怎么买 / 为什么买不了」。
+   *
+   * 与 paperPlansFromRows 的区别: 这个**不写任何计划**, 只回预览, 失败行也给
+   * 中文原因 (前端据此解释, 而不是画一堆 `--`)。
+   */
+  paperPlansPreview: (body: PaperPlanFromRowsPayload, account?: string) =>
+    request<PaperPlanPreviewResponse>('/api/paper/plans/preview', {
+      method: 'POST',
+      body: JSON.stringify(account ? { ...body, account_id: account } : body),
+    }),
+
+  paperPlanConfigSave: (cfg: PaperPlanCfg, account?: string) =>
+    request<{ ok: boolean; cfg: PaperPlanCfg }>('/api/paper/plan_config', {
+      method: 'PUT',
+      body: JSON.stringify(account ? { account_id: account, cfg } : { cfg }),
     }),
 
   /** 模拟触发 ladder 封单监控 (Dev 调试, 不落盘不推送) */

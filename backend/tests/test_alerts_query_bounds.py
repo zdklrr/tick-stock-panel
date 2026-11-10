@@ -67,3 +67,57 @@ def test_valid_params_still_return_all_records(tmp_path):
         resp = client.get("/api/alerts", params=params)
         assert resp.status_code == 200, resp.text
         assert len(resp.json()["alerts"]) == min(3, params["limit"])
+
+
+def _client_with_names(tmp_path, name_map: dict[str, str]) -> TestClient:
+    """带 get_name_map 的 repo 桩 — 复现真实 repo 的名称解析入口。"""
+    repo = SimpleNamespace(
+        store=SimpleNamespace(data_dir=tmp_path),
+        get_name_map=lambda symbols=None: {
+            s: n for s, n in name_map.items() if symbols is None or s in set(symbols)
+        },
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.state.repo = repo
+    return TestClient(app)
+
+
+def test_missing_name_is_backfilled_on_read(tmp_path):
+    """v0.3.30 之前落盘的模拟盘事件没有 name, 读时应按 symbol 回填。"""
+    now_ms = int(time.time() * 1000)
+    alert_store.append_many(
+        tmp_path,
+        [
+            {
+                "ts": now_ms,
+                "source": "paper",
+                "type": "auto_order",
+                "symbol": "600327.SH",
+                "message": "自动跟单触发买入下单 (次日开盘) 700股",
+            },
+            {
+                "ts": now_ms - 1000,
+                "source": "paper",
+                "type": "auto_order",
+                "symbol": "000001.SZ",
+                "name": "平安银行",  # 已有名称不能被覆盖
+                "message": "自动跟单买入 平安银行(000001.SZ) 100股",
+            },
+        ],
+    )
+    client = _client_with_names(
+        tmp_path, {"600327.SH": "大东方", "000001.SZ": "改名了"}
+    )
+    alerts = client.get("/api/alerts").json()["alerts"]
+    by_symbol = {a["symbol"]: a for a in alerts}
+    assert by_symbol["600327.SH"]["name"] == "大东方"
+    assert by_symbol["000001.SZ"]["name"] == "平安银行"
+
+
+def test_name_backfill_survives_repo_without_name_map(tmp_path):
+    """repo 没有 get_name_map 时不能 500, 记录原样返回。"""
+    _seed(tmp_path, 1)
+    resp = _client(tmp_path).get("/api/alerts")
+    assert resp.status_code == 200
+    assert len(resp.json()["alerts"]) == 1

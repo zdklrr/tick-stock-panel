@@ -51,11 +51,12 @@ def test_multi_account_isolation_and_settings(client: TestClient):
     assert client.get("/api/paper/overview?account=acc_a").json()["initial_cash"] == 500000
     assert client.get("/api/paper/overview").json()["initial_cash"] == 1000000
 
-    # settings: 开启涨跌停排队 → 账户字段更新
-    r = client.post("/api/paper/settings?account=acc_a", json={"queue_limit_orders": True})
-    assert r.status_code == 200 and r.json()["account"]["queue_limit_orders"] is True
+    # settings: 默认排队开启; 可显式关闭 → 账户字段更新
     assert client.get("/api/paper/overview?account=acc_a").json()["queue_limit_orders"] is True
-    assert client.get("/api/paper/overview").json()["queue_limit_orders"] is False
+    r = client.post("/api/paper/settings?account=acc_a", json={"queue_limit_orders": False})
+    assert r.status_code == 200 and r.json()["account"]["queue_limit_orders"] is False
+    assert client.get("/api/paper/overview?account=acc_a").json()["queue_limit_orders"] is False
+    assert client.get("/api/paper/overview").json()["queue_limit_orders"] is True
 
     # 非法账户 id → 400 (路径穿越防护)
     assert client.get("/api/paper/overview?account=../x").status_code == 400
@@ -166,3 +167,184 @@ def test_compare_accounts(client: TestClient):
     # 字段完整性 (对比表依赖)
     for key in ("cash", "market_value", "total_pnl", "profit_loss_ratio", "max_drawdown", "avg_holding_days", "realized_pnl"):
         assert key in row
+
+
+def test_overview_holdings_join_active_plan(client: TestClient):
+    """overview holdings join 活跃计划: 补 plan_* 字段; 同 symbol 多条取最早;
+    计划取消后不再 join; 无计划 symbol 不写这些键。"""
+    from app.strategy import paper, paper_plans
+
+    assert client.post("/api/paper/account", json={"initial_cash": 1000000, "name": "主账户"}).status_code == 200
+    p1 = client.post("/api/paper/plans", json={
+        "symbol": "600519.SH", "name": "贵州茅台",
+        "entry_low": 98.0, "entry_high": 102.0, "stop": 96.0, "qty_planned": 1000,
+    }).json()["plan"]
+    # 同 symbol 第二条活跃计划 (更晚创建) — join 必须选最早那条
+    client.post("/api/paper/plans", json={
+        "symbol": "600519.SH", "entry_low": 100.0, "entry_high": 110.0, "stop": 95.0, "qty_planned": 500,
+    })
+    # 另一只票的无关计划
+    client.post("/api/paper/plans", json={
+        "symbol": "000001.SZ", "entry_low": 9.0, "entry_high": 11.0, "stop": 8.5, "qty_planned": 1000,
+    })
+
+    # 造持仓: 600519.SH 1000股 @ 100, 300750.SZ 200股 @ 50 (无计划)
+    root = paper._root(client.app.state.repo.store.data_dir)
+    (root / "positions.json").write_text(
+        __import__("json").dumps(
+            {"positions": {
+                "600519.SH": {"asset_type": "stock", "qty": 1000, "avg_cost": 100.0,
+                              "available_qty": 1000, "lots": [{"date": "2026-01-01", "qty": 1000}]},
+                "300750.SZ": {"asset_type": "stock", "qty": 200, "avg_cost": 50.0,
+                              "available_qty": 200, "lots": [{"date": "2026-01-01", "qty": 200}]},
+            }},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    ov = client.get("/api/paper/overview").json()
+    assert ov["initialized"] is True
+    by_sym = {h["symbol"]: h for h in ov["holdings"]}
+
+    h1 = by_sym["600519.SH"]
+    assert h1["plan_stop_loss"] == pytest.approx(96.0)
+    assert h1["plan_target1"] == pytest.approx(106.0)   # entry_ref=(98+102)/2=100 → t1=100+1.5*(100-96)? 实测 106: r1=1.5
+    assert h1["plan_target2"] is not None
+    assert h1["plan_entry_mode"] == "zone"
+    assert h1["plan_source"] == "手动" or h1["plan_source"]  # 人话来源, 手工计划为 source 原文/「手动」口径
+    assert h1["position_pct"] > 0                        # paper.overview 补的纯字段
+
+    # 无计划的票: 键要么缺失要么 None
+    h2 = by_sym["300750.SZ"]
+    assert h2.get("plan_stop_loss") in (None,) and h2.get("plan_entry_mode") is None
+
+    # 计划取消后 join 落空 → 键缺失或 None (无计划 symbol 不写这些键)
+    paper_plans.cancel_plan(client.app.state.repo.store.data_dir, p1["id"])
+    # 把另一条同 symbol 的计划也取消
+    for plan in paper_plans.list_plans(client.app.state.repo.store.data_dir, status=("pending",)):
+        if plan["symbol"] == "600519.SH":
+            paper_plans.cancel_plan(client.app.state.repo.store.data_dir, plan["id"])
+    ov2 = client.get("/api/paper/overview").json()
+    h1b = next(h for h in ov2["holdings"] if h["symbol"] == "600519.SH")
+    assert h1b.get("plan_stop_loss") is None and h1b.get("plan_entry_mode") is None
+    assert h1b.get("plan_source") is None
+
+
+def test_overview_holding_name_falls_back_to_plan(client: TestClient):
+    """持仓没有 name (老台账) 时, 用关联计划的名称兜底显示。"""
+    from app.strategy import paper
+
+    assert client.post("/api/paper/account", json={"initial_cash": 1000000, "name": "主账户"}).status_code == 200
+    client.post("/api/paper/plans", json={
+        "symbol": "600519.SH", "name": "贵州茅台",
+        "entry_low": 98.0, "entry_high": 102.0, "stop": 96.0, "qty_planned": 1000,
+    })
+    root = paper._root(client.app.state.repo.store.data_dir)
+    (root / "positions.json").write_text(
+        __import__("json").dumps(
+            {"positions": {"600519.SH": {"asset_type": "stock", "qty": 1000, "avg_cost": 100.0,
+                                         "available_qty": 1000, "lots": []}}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    ov = client.get("/api/paper/overview").json()
+    h = ov["holdings"][0]
+    assert h["name"] == "贵州茅台"           # 来自计划的兜底
+    assert "price_date" in h and "priced" in h
+    assert "prev_close" in h and "day_pnl" in h and "day_pnl_pct" in h
+
+
+def test_overview_exposes_day_pnl_and_price_source(client: TestClient):
+    """overview 顶层给出今日盈亏与估值口径来源 (前端今日盈亏卡依赖)。"""
+    assert client.post("/api/paper/account", json={"initial_cash": 1000000}).status_code == 200
+    ov = client.get("/api/paper/overview").json()
+    assert ov["initialized"] is True
+    assert "day_pnl" in ov and "day_pnl_pct" in ov
+    assert ov["price_source"] in ("live", "daily", "cost")
+    assert ov["estimating"] is False  # 无盘中快照
+
+
+def test_positions_uses_daily_valuation_and_names(client: TestClient):
+    """/positions 同样用日线口径估值并回填名称 (非交易时段不再恒 0 盈亏)。"""
+    from app.strategy import paper
+
+    assert client.post("/api/paper/account", json={"initial_cash": 1000000}).status_code == 200
+    client.post("/api/paper/orders", json={"symbol": "600519.SH", "side": "buy", "qty": 1000, "ref_price": 100.0})
+    root = paper._root(client.app.state.repo.store.data_dir)
+    (root / "positions.json").write_text(
+        __import__("json").dumps(
+            {"positions": {"600519.SH": {"name": "贵州茅台", "asset_type": "stock", "qty": 1000,
+                                         "avg_cost": 100.0, "available_qty": 1000, "lots": []}}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    body = client.get("/api/paper/positions").json()
+    h = body["holdings"][0]
+    assert h["name"] == "贵州茅台"
+    assert "day_pnl" in h and "priced" in h
+
+
+def test_plans_list_fills_missing_names_from_name_map(client: TestClient):
+    """存量自动计划 name 为 None 时, /plans 用维表名称兜底 (0.3.47)。
+
+    自动跟单补建计划时没把名称传下去, 老库里那批计划只有代码; 这里确认
+    列表接口会就地回填, 且不改动其它数值字段。
+    """
+    from app.strategy import paper as paper_mod
+    from app.strategy import paper_plans
+
+    assert client.post("/api/paper/account", json={"initial_cash": 1000000}).status_code == 200
+
+    # 直接落一条 name=None 的存量计划 (模拟 0.3.46 之前补建的那批)
+    data_dir = client.app.state.repo.store.data_dir
+    default_id = paper_mod.list_accounts(data_dir)[0]["id"]
+    paper_plans.create_plan(
+        data_dir,
+        {
+            "symbol": "300007.SZ",
+            "entry_low": 38.0,
+            "entry_high": 40.0,
+            "stop": 36.0,
+            "qty_planned": 1000,
+        },
+        default_id,
+    )
+
+    # 给假仓储补上名称查询能力 (真仓储读 instruments 维表)
+    client.app.state.repo.get_name_map = lambda syms: {"300007.SZ": "汉威科技"}
+
+    body = client.get("/api/paper/plans").json()
+    plan = next(p for p in body["plans"] if p["symbol"] == "300007.SZ")
+    assert plan["name"] == "汉威科技"
+    assert plan["qty_planned"] == 1000            # 数值字段不受影响
+    assert plan["entry_low"] == 38.0
+
+
+def test_plans_list_without_name_map_keeps_code_only(client: TestClient):
+    """仓储无 get_name_map (裸 app 单测) 时不联网、不抛, 只有代码。"""
+    from app.strategy import paper as paper_mod
+    from app.strategy import paper_plans
+
+    assert client.post("/api/paper/account", json={"initial_cash": 1000000}).status_code == 200
+    data_dir = client.app.state.repo.store.data_dir
+    default_id = paper_mod.list_accounts(data_dir)[0]["id"]
+    paper_plans.create_plan(
+        data_dir,
+        {
+            "symbol": "300473.SZ",
+            "entry_low": 45.0,
+            "entry_high": 47.0,
+            "stop": 43.0,
+            "qty_planned": 500,
+        },
+        default_id,
+    )
+
+    body = client.get("/api/paper/plans").json()
+    plan = next(p for p in body["plans"] if p["symbol"] == "300473.SZ")
+    assert plan["name"] is None

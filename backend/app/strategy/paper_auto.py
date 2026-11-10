@@ -24,6 +24,7 @@ from pathlib import Path
 from app.market_time import cn_now
 from app.services.fs_utils import atomic_write_text
 from app.strategy import paper
+from app.strategy import trade_plan as _tp
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,8 @@ def validate_rule(rule: dict) -> None:
         raise ValueError("size_value 必须是正数")
     if rule.get("size_mode") == "pct_equity" and value > 100:
         raise ValueError("pct_equity 的 size_value 不能超过 100 (%)")
+    if rule.get("position_mode") not in (None, "fixed", "equal_total"):
+        raise ValueError(f"position_mode 非法: {rule.get('position_mode')!r} (应为 fixed / equal_total)")
     if rule.get("order_type") not in ("market", "next_open", "close"):
         raise ValueError(f"order_type 非法: {rule.get('order_type')!r}")
     cooldown = rule.get("cooldown_days", 0)
@@ -85,6 +88,7 @@ def normalize_rule(rule: dict) -> dict:
     d.setdefault("order_type", "next_open")
     d.setdefault("cooldown_days", 5)
     d.setdefault("max_positions", 0)   # 0 = 不限制 (对齐回测 max_positions 语义)
+    d.setdefault("position_mode", "fixed")  # fixed=每票固定% / equal_total=总仓均分(建议总仓÷实际只数)
     d.setdefault("enabled", True)
     d.setdefault("created_at", _now_iso())
     return d
@@ -159,16 +163,139 @@ def _in_cooldown(data_dir: Path, rule: dict, symbol: str, cooldown_days: int, ac
 def _sizing_qty(data_dir: Path, rule: dict, ref_price: float, account_id: str) -> int:
     if ref_price <= 0:
         return 0
-    if rule["size_mode"] == "fixed_amount":
-        amount = float(rule["size_value"])
-    else:  # pct_equity: 按账户总权益 (现金 + 最新定版持仓市值)
-        acc = paper.get_account(data_dir, account_id)
-        if acc is None:
-            return 0
-        nav_rows = paper.load_nav(data_dir, account_id)
-        equity = nav_rows[-1]["nav"] if nav_rows else float(acc["cash"])
-        amount = equity * float(rule["size_value"]) / 100.0
-    return paper.qty_from_amount(amount, ref_price)
+    position_mode = rule.get("position_mode", "fixed") or "fixed"
+    if rule["size_mode"] == "fixed_amount" or position_mode == "fixed":
+        # fixed_amount 模式与 fixed 仓位模式: 直接按规则给定的金额/比例
+        if rule["size_mode"] == "fixed_amount":
+            amount = float(rule["size_value"])
+        else:  # pct_equity + fixed: 每票固定占权益 size_value%
+            acc = paper.get_account(data_dir, account_id)
+            if acc is None:
+                return 0
+            nav_rows = paper.load_nav(data_dir, account_id)
+            equity = nav_rows[-1]["nav"] if nav_rows else float(acc["cash"])
+            amount = equity * float(rule["size_value"]) / 100.0
+        return paper.qty_from_amount(amount, ref_price)
+    # equal_total: 每票 = 建议总仓 ÷ 计划持仓只数 (受大盘择时×情绪×外围缩放)
+    acc = paper.get_account(data_dir, account_id)
+    if acc is None:
+        return 0
+    nav_rows = paper.load_nav(data_dir, account_id)
+    equity = nav_rows[-1]["nav"] if nav_rows else float(acc["cash"])
+    # 建议总仓% = 100 × 择时 × 情绪 × 外围风险×回撤 (与计划驱动买入同源;
+    # 绝不用 synthesize() 的合成 exposure —— 已乘过大盘情绪, 会重复计入)
+    timing = 1.0
+    phase = 1.0
+    max_pos_pct = 20.0
+    cfg: dict = {}
+    state = None
+    try:
+        from app.strategy import paper_plans as _pp
+
+        ctx = _pp.buy_ctx(data_dir, account_id)
+        cfg = ctx["cfg"]
+        state = ctx["state"]
+        radar = ctx["radar"]
+        timing = _tp.trend_exposure(data_dir).get("exposure") or 1.0
+        phase = _tp.exposure_multiplier(state, cfg)
+        gexp = float(radar.get("global_exposure") or 1.0)
+        efac = float(radar.get("equity_factor") or 1.0)
+        radar_adj = min(max(gexp * efac, 0.5), 1.5)
+        total_pct = max(0.0, min(100.0, 100.0 * float(timing) * float(phase) * radar_adj))
+        max_pos_pct = float(cfg.get("max_pos_pct") or 20.0)
+    except Exception as e:  # noqa: BLE001 — 任何缺失一律回退到固定比例
+        logger.warning("paper auto equal_total 估算总仓失败 (回退 fixed): %s", e)
+        total_pct = float(rule.get("size_value", 0)) or 0.0
+    # 分母 = **计划持仓只数**(缩放后的只数上限), 不是「当前已持有 + 1」。
+    # 用已持有数会两头出错: 第一票就吃掉 100% 权益(择时中性时), 且后续每票
+    # 越买越小、总投入反而超过建议总仓。按计划只数均分才是「总仓均分」。
+    raw_max = int(rule.get("max_positions", 0) or 0)
+    cfg_max = int(cfg.get("max_symbols") or 0)
+    if raw_max > 0:
+        # ① 规则自身设了只数上限 → 按缩放后的上限均分 (择时弱 → 只数变少 → 每票变大)。
+        #    例: 建议总仓 35%、弱市只买 2 只 → 每票 17.5%; 只买 1 只 → 该票 35%。
+        count = _scaled_max_positions(raw_max, {"timing": timing, "phase": phase})
+        per_ticket_pct = total_pct / count if count > 0 else total_pct
+    elif cfg_max > 0:
+        # ② 规则没设, 但交易计划配置里设了 max_symbols → 同源口径 (含 min_holdings)
+        limit = _tp.effective_holdings_limit(
+            cfg, state, timing_exposure=timing
+        ).get("limit")
+        count = int(limit or cfg_max)
+        per_ticket_pct = total_pct / count if count > 0 else total_pct
+    else:
+        # ③ 两边都没设 = 不限制只数 → 不知道最终会买几只, 只能按「已占槽 + 本次开仓」
+        #    估分母, 并用单票仓位上限 (max_pos_pct, 默认 20%) 兜底: 否则第一票就吃掉
+        #    全部权益, 资金预检还会因手续费直接拒单。
+        count = max(1, len(_position_slots_used(data_dir, account_id)) + 1)
+        per_ticket_pct = min(total_pct / count, max_pos_pct)
+    amount = equity * per_ticket_pct / 100.0
+    return paper.qty_from_amount(_affordable(amount, acc), ref_price)
+
+
+def _affordable(amount: float, acc: dict) -> float:
+    """把买入金额压到「可用现金能付得起」的范围内 (留 0.5% 给手续费+滑点)。
+
+    建议总仓 100% 时, 最后几票会因手续费超出可用资金被 create_order 预检拒绝
+    (「可用资金不足」), 表现为明明有额度却少买一只。这里按现金兜底, 宁可买得
+    略少一点, 也不要整票被拒。
+    """
+    try:
+        cash = float(acc.get("cash") or 0.0)
+    except (TypeError, ValueError):
+        return amount
+    return min(amount, cash * 0.995)
+
+
+def _auto_sizing_coeffs(data_dir: Path, account_id: str) -> dict:
+    """自动跟单的仓位系数 {timing, phase, radar_adj, ok}。
+
+    - timing: 大盘择时系数 (trade_plan.trend_exposure, 缺失按 1.0)
+    - phase:  情绪周期系数 (trade_plan.exposure_multiplier, 缺失按 1.0)
+    - radar_adj: 外围风险 × 账户回撤 (paper_plans._radar_coeffs, 夹 [0.5,1.5])
+
+    与计划驱动买入 (_plan_adj / position_adjust) 同源: **刻意不用风险雷达的合成
+    exposure** —— 它已乘过大盘情绪, 会重复计入; 且被夹在 [0.35,1.10], 在最需要
+    缩仓时恰好恒等于 1, 把缩仓信号抹平。
+
+    任何环节异常一律按 1.0 (无信号, 不加不减), 绝不抛异常卡住自动跟单。
+    """
+    out = {"timing": 1.0, "phase": 1.0, "radar_adj": 1.0, "ok": False}
+    try:
+        from app.strategy import paper_plans as _pp
+
+        cfg = _pp.load_cfg(data_dir, account_id)
+        state = _tp.latest_state(data_dir)
+        timing = _tp.trend_exposure(data_dir).get("exposure") or 1.0
+        phase = _tp.exposure_multiplier(state, cfg)
+        radar = _pp._radar_coeffs(data_dir, account_id)
+        gexp = float(radar.get("global_exposure") or 1.0)
+        efac = float(radar.get("equity_factor") or 1.0)
+        radar_adj = min(max(gexp * efac, 0.5), 1.5)
+        out = {
+            "timing": float(timing),
+            "phase": float(phase),
+            "radar_adj": radar_adj,
+            "ok": True,
+        }
+    except Exception as e:  # noqa: BLE001 — 择时/雷达缺失时按无信号处理
+        logger.warning("paper auto 读取仓位系数失败 (按 1.0 计): %s", e)
+    return out
+
+
+def _scaled_max_positions(max_positions: int, coeffs: dict) -> int:
+    """只数上限缩放: max_positions(乐观上限) × 择时 × 情绪, 取整并**夹在 [1, max]**。
+
+    - 上界不能超过用户设的 max_positions: 用户说「最多 5 只」就是最多 5 只,
+      择时系数 >1 时不该反而多买 (round(5×1.2)=6 会越界)。
+    - 下界保 1: 弱市也不能缩到 0, 否则完全错过行情 (与 plan_config.min_holdings 同理)。
+    """
+    if max_positions <= 0:
+        return 0
+    timing = float(coeffs.get("timing") or 1.0)
+    phase = float(coeffs.get("phase") or 1.0)
+    scaled = int(round(max_positions * timing * phase))
+    return min(max(scaled, 1), max_positions)
 
 
 def _position_slots_used(data_dir: Path, account_id: str) -> set[str]:
@@ -239,11 +366,18 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
                 if side == "buy":
                     max_positions = int(rule.get("max_positions", 0))
                     if max_positions > 0:
+                        # 缩放硬上限: 把 max_positions 当乐观上限, 乘「大盘择时 × 情绪系数」缩放,
+                        # 保下限 1 只 (严禁缩到 0 而错过行情), 且不超过用户设的上限。
+                        # 卖出/止损完全不参与缩放 (卖出不打折)。
+                        coeffs = _auto_sizing_coeffs(data_dir, account_id)
+                        scaled_max = _scaled_max_positions(max_positions, coeffs)
                         used = _position_slots_used(data_dir, account_id)
-                        if len(used) >= max_positions and symbol not in used:
+                        if len(used) >= scaled_max and symbol not in used:
                             logger.info(
-                                "paper auto %s: %s 跳过开仓 — 已达最大持仓 %d (%s)",
-                                rule["name"], symbol, max_positions, ", ".join(sorted(used)) or "空",
+                                "paper auto %s: %s 跳过开仓 — 已达最大持仓(择时缩放后) %d (=上限%d×择时%.2f×情绪%.2f) (%s)",
+                                rule["name"], symbol, scaled_max, max_positions,
+                                float(coeffs["timing"]), float(coeffs["phase"]),
+                                ", ".join(sorted(used)) or "空",
                             )
                             continue
                     qty = _sizing_qty(data_dir, rule, float(price), account_id)
@@ -271,38 +405,121 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
                     order_type=rule["order_type"],
                     ref_price=float(price),
                     source=f"auto:{rule['id']}",
+                    # 事件自带名称就随订单落盘 (维表残缺时持仓仍能显示中文名)
+                    name=str(ev.get("name") or "").strip() or None,
                 )
                 if err:
                     logger.info("paper auto %s: %s 下单被拒: %s", rule["name"], symbol, err)
                     continue
+                # 触发上下文只留在内存订单上 (不落盘, 不改订单文件 schema):
+                # auto_order_events 用它把「是什么触发的」拼进事件, 否则只有 arule id。
+                order["auto_meta"] = {
+                    "rule_name": str(rule.get("name") or ""),
+                    "match_kind": str(rule.get("match_kind") or ""),
+                    "match_id": str(rule.get("match_id") or ""),
+                    "event_type": str(ev.get("type") or ""),
+                    "event_price": float(price),
+                }
                 created.append(order)
                 logger.info("paper auto %s: %s 触发 %s %d 股 (%s)", rule["name"], symbol, side, qty, order["id"])
     return created
 
 
 _ORDER_TYPE_LABEL = {"market": "即时", "next_open": "次日开盘", "close": "当日收盘"}
+# 成交方式短语 (message 用): 与 _ORDER_TYPE_LABEL 同源, 但补足「价成交」语义。
+_ORDER_TYPE_PHRASE = {
+    "market": "即时价成交",
+    "next_open": "次日开盘价成交",
+    "close": "当日收盘价成交",
+}
+# 触发事件类型 → 中文触发原因 (事件里只有 type, 用户看不懂 buy_signal/pool_entry)
+_TRIGGER_LABEL = {
+    "buy_signal": "策略买入信号",
+    "sell_signal": "策略卖出信号",
+    "pool_entry": "策略进入股票池",
+    "pool_exit": "策略移出股票池",
+}
+_MATCH_KIND_LABEL = {"strategy": "跟策略", "rule": "跟监控规则"}
 
 
-def auto_order_events(created: list[dict], account_id: str = paper.DEFAULT_ACCOUNT_ID) -> list[dict]:
+def _trigger_label(event_type: str) -> str:
+    """监控事件类型 → 人类可读的触发原因。未知类型按「监控规则命中」兜底。"""
+    return _TRIGGER_LABEL.get(event_type or "", "监控规则命中")
+
+
+def format_auto_order_message(ev: dict) -> str:
+    """自动跟单事件 → 一句话讲清「谁触发、买什么、多少、怎么成交」。
+
+    name 由调用方回填后再调本函数重建文案 (本域无维表访问权, 生成事件时
+    还不知道股票名称), 因此该函数是纯函数, 可被外部按最新字段重算。
+    """
+    name = str(ev.get("name") or "").strip()
+    symbol = str(ev.get("symbol") or "").strip()
+    target = f"{name}({symbol})" if name and symbol else (name or symbol)
+    side_label = "买入" if ev.get("side") == "buy" else "卖出"
+    account_name = str(ev.get("account_name") or "").strip()
+    head = (
+        f"账户[{account_name}] 自动跟单{side_label} {target} {ev.get('qty')}股"
+        if account_name
+        else f"自动跟单{side_label} {target} {ev.get('qty')}股"
+    )
+    parts = [head]
+
+    rule_name = str(ev.get("rule_name") or "").strip()
+    match_id = str(ev.get("match_id") or "").strip()
+    match_label = _MATCH_KIND_LABEL.get(str(ev.get("match_kind") or ""), "")
+    if rule_name:
+        rule_text = f"规则「{rule_name}」"
+        if match_id and match_label:
+            rule_text += f"({match_label} {match_id})"
+        parts.append(rule_text)
+    reason = str(ev.get("reason") or "").strip()
+    if reason:
+        parts.append(f"触发: {reason}")
+    order_type = str(ev.get("order_type") or "")
+    parts.append(_ORDER_TYPE_PHRASE.get(order_type, _ORDER_TYPE_LABEL.get(order_type, order_type)))
+    return " · ".join(p for p in parts if p)
+
+
+def auto_order_events(
+    created: list[dict],
+    account_id: str = paper.DEFAULT_ACCOUNT_ID,
+    account_name: str = "",
+) -> list[dict]:
     """自动跟单创建的订单 → 推送事件。与成交事件同构 (source=paper 对齐
     AlertEvent), 走同一推送通道; rule_id 从 order.source (auto:{rule_id}) 还原。
+
+    自解释字段: rule_name(规则名) / match_kind+match_id(跟的是策略还是监控规则) /
+    reason(触发原因) / account_name(账户名)。`name`(股票名称) 生成时未知 —
+    由调用方 (quote_service 模拟盘钩子) 统一回填, 回填后调
+    format_auto_order_message() 重建 message, 使文案带上股票名称。
     """
     events: list[dict] = []
     for o in created:
         source = str(o.get("source", ""))
         rule_id = source.removeprefix("auto:") if source.startswith("auto:") else ""
-        side_label = "买入" if o["side"] == "buy" else "卖出"
-        type_label = _ORDER_TYPE_LABEL.get(o["order_type"], o["order_type"])
-        events.append({
+        meta = o.get("auto_meta") or {}
+        match_kind = str(meta.get("match_kind") or "")
+        match_id = str(meta.get("match_id") or "")
+        ev = {
             "source": "paper",
             "type": "auto_order",
             "severity": "info",
             "ts": int(cn_now().timestamp() * 1000),
             "symbol": o["symbol"],
+            "name": "",  # 由调用方按 symbol→name 维表回填
             "rule_id": rule_id,
+            "rule_name": str(meta.get("rule_name") or ""),
+            "strategy_id": match_id if match_kind == "strategy" else None,
+            "match_kind": match_kind,
+            "match_id": match_id,
             "side": o["side"],
             "qty": o["qty"],
+            "order_type": o["order_type"],
             "account_id": account_id,
-            "message": f"自动跟单触发{side_label}下单 ({type_label}) {o['qty']}股",
-        })
+            "account_name": account_name or account_id,
+            "reason": _trigger_label(str(meta.get("event_type") or "")),
+        }
+        ev["message"] = format_auto_order_message(ev)
+        events.append(ev)
     return events

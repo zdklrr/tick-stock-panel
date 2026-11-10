@@ -144,9 +144,14 @@ def test_sync_instruments_interrupted_keeps_existing_table(tmp_path: Path, crash
     target = tmp_path / "instruments" / "instruments.parquet"
     old = _instruments(["浦发银行", "平安银行"])
     _seed(old, target)
+    # 新源必须不小于现有表行数, 否则会被「拒绝缩表」护栏提前 return (见
+    # test_instrument_sync_share_fields.py), 就走不到 atomic 写入路径了。
     monkeypatch.setattr(
         instrument_sync, "_fetch_instruments_via_provider",
-        lambda: [{"symbol": "600036.SH", "name": "招商银行"}],
+        lambda: [
+            {"symbol": "600036.SH", "name": "招商银行"},
+            {"symbol": "000002.SZ", "name": "万科A"},
+        ],
     )
 
     crash.armed = True
@@ -155,8 +160,10 @@ def test_sync_instruments_interrupted_keeps_existing_table(tmp_path: Path, crash
     assert_frame_equal(pl.read_parquet(target), old)
 
     crash.armed = False
-    assert instrument_sync.sync_instruments(tmp_path) == 1
-    assert pl.read_parquet(target)["symbol"].to_list() == ["600036.SH"]
+    assert instrument_sync.sync_instruments(tmp_path) == 4  # 新 2 行 + 旧表补回 2 行
+    symbols = pl.read_parquet(target)["symbol"].to_list()
+    assert "600036.SH" in symbols and "000002.SZ" in symbols
+    assert "600000.SH" in symbols and "000001.SZ" in symbols  # 旧标的没被冲掉
     assert _no_tmp_left(target)
 
 

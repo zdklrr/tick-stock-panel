@@ -74,6 +74,16 @@ interface ScreenerTableProps {
   extSeriesData?: Record<string, Record<string, [string, number][]>>
   /** 分时列集合竞价叠加数据: symbol → 竞价价格/匹配量/未匹配量点列 */
   auctionData?: Record<string, MiniIntradayAuctionSeries>
+  /** 行选择集合（只在传入 onToggleSelect 时生效: 代码列前多一个复选框） */
+  selectedSymbols?: Set<string>
+  /** 勾选/取消某一行（提供它才显示复选框列） */
+  onToggleSelect?: (symbol: string) => void
+  /** 表头全选/反选（不传则表头不显示全选框） */
+  onToggleSelectAll?: () => void
+  /** 当前是否已全选（表头复选框的选中态） */
+  allSelected?: boolean
+  /** 可勾选行数（0 时表头复选框禁用） */
+  selectableCount?: number
 }
 
 /** 渲染标签数组（含 maxTags 折叠/展开、横竖排列）。策略列与 ext 列共用。
@@ -180,7 +190,10 @@ export function ScreenerTable({
   intradayYMode = 'adaptive', onToggleIntradayYMode, assetType = 'stock',
   strategyTagsExpanded = false, onToggleStrategyTags,
   sort, onSortToggle, activeSymbol, extSeriesData = {}, auctionData = {},
+  selectedSymbols, onToggleSelect, onToggleSelectAll, allSelected = false, selectableCount = 0,
 }: ScreenerTableProps) {
+  // 行选择: 只在调用方提供 onToggleSelect 时启用 (自选页等其它复用方不受影响)
+  const selectable = !!onToggleSelect
   const [expandedCells, setExpandedCells] = useState<Set<string>>(new Set())
   const [dimensionTarget, setDimensionTarget] = useState<DimensionMembersTarget | null>(null)
 
@@ -278,6 +291,15 @@ export function ScreenerTable({
         return (
           <td key={col.id} className="px-4 py-2">
             <div className="flex items-center gap-2">
+              {selectable && (
+                <input
+                  type="checkbox"
+                  aria-label={`选择 ${r.symbol}`}
+                  checked={selectedSymbols?.has(r.symbol) ?? false}
+                  onChange={() => onToggleSelect?.(r.symbol)}
+                  className="h-3.5 w-3.5 shrink-0 accent-accent cursor-pointer"
+                />
+              )}
               <button
                 type="button"
                 onClick={() => onPreview(r.symbol, r.name ?? '', toNavItems(rows))}
@@ -450,6 +472,25 @@ export function ScreenerTable({
         renderHeaderContent={(col) => {
         if (col.source.type !== 'builtin') return undefined
         const key = col.source.key
+        // 代码列: 勾选列时表头放全选框 (阻止冒泡, 否则会触发该列排序)
+        if (key === 'symbol' && selectable) {
+          return (
+            <span className="inline-flex items-center gap-2">
+              {onToggleSelectAll && (
+                <input
+                  type="checkbox"
+                  aria-label={allSelected ? '取消全选' : '全选可见标的'}
+                  checked={allSelected}
+                  disabled={selectableCount === 0}
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={() => onToggleSelectAll()}
+                  className="h-3.5 w-3.5 shrink-0 accent-accent cursor-pointer disabled:cursor-not-allowed"
+                />
+              )}
+              <span>{col.label}</span>
+            </span>
+          )
+        }
         // 日k 蜡烛图开关
         if (key === 'candle' && onToggleDailyKChart) {
           return (

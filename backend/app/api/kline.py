@@ -308,11 +308,24 @@ def search_instruments(
 
 @router.post("/instruments/names")
 def instruments_names(request: Request, symbols: list[str]):
-    """批量查标的名称 (股票 + ETF + 指数)。传入 symbol 列表, 返回 {symbol: name}。"""
+    """批量查标的名称 (股票 + ETF + 指数)。传入 symbol 列表, 返回 {symbol: name}。
+
+    维表缺标的时 (曾出现降级源只覆盖沪市、深市整行缺失) 用腾讯实时快照兜底,
+    保证持仓/自选/监控的「名称」不会只剩代码。兜底结果不回写维表。
+    """
     if not symbols:
         return {"names": {}}
     repo = request.app.state.repo
-    return {"names": repo.get_name_map(symbols)}
+    names = repo.get_name_map(symbols)
+    missing = [s for s in symbols if s not in names]
+    if missing:
+        try:
+            from app.services import instrument_sync
+
+            names.update(instrument_sync.lookup_names_online(missing))
+        except Exception as e:  # noqa: BLE001 — 名称兜底失败不影响接口
+            logger.warning("instruments/names 在线兜底失败: %s", e)
+    return {"names": names}
 
 
 def _get_stock_info(repo, symbol: str) -> dict:

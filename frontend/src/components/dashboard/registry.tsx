@@ -8,7 +8,7 @@ import type { CSSProperties } from 'react'
 import type { ReactNode } from 'react'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowUpRight, BarChart3, BellRing, Flame, Gauge, LineChart, Link2, Sparkles, Target, TrendingUp, TrendingDown, Coins, Repeat } from 'lucide-react'
+import { ArrowUpRight, BarChart3, BellRing, Compass, Flame, Gauge, LineChart, Link2, ShieldAlert, Sparkles, Sunrise, Target, TrendingUp, TrendingDown, Coins, Repeat } from 'lucide-react'
 import type { AlertEvent, OverviewMarket } from '@/lib/api'
 import { fmtBigNum } from '@/lib/format'
 import type { DimensionMembersTarget } from '@/components/DimensionMembersDialog'
@@ -21,6 +21,7 @@ import {
 } from './widgets'
 import type { DashboardItem, WidgetType } from './layout'
 import { ExternalLinkWidget } from './ExternalLinkWidget'
+import { GlobalRiskWidget, PremarketWidget, RegimePhaseWidget, TimingWidget } from './RiskWidgets'
 
 /** 渲染上下文: 数据切片与交互回调(由 Dashboard 页提供, 组件不自取数据) */
 export interface WidgetCtx {
@@ -188,6 +189,24 @@ export const WIDGET_DEFS: WidgetDef[] = [
       </>,
     ),
   },
+  // ── 决策辅助四卡: 均为「一个方向 + 一条系数」的窄卡, 数据自取(不吃 WidgetCtx),
+  //    与情绪雷达正交: 盘前=开盘方向 / 择时=趋势 / 情绪周期=阶段 / 风险雷达=外围风险。
+  {
+    id: 'premarket', label: '盘前简报', icon: Sunrise, minW: 2, minH: 7, defW: 3, defH: 9,
+    render: () => <PremarketWidget />,
+  },
+  {
+    id: 'timing', label: '大盘择时', icon: Compass, minW: 2, minH: 8, defW: 3, defH: 9,
+    render: () => <TimingWidget />,
+  },
+  {
+    id: 'regime-phase', label: '情绪周期', icon: Flame, minW: 2, minH: 7, defW: 3, defH: 9,
+    render: () => <RegimePhaseWidget />,
+  },
+  {
+    id: 'global-risk', label: '风险雷达', icon: ShieldAlert, minW: 2, minH: 8, defW: 3, defH: 9,
+    render: () => <GlobalRiskWidget />,
+  },
   {
     id: 'radar', label: '情绪雷达', icon: Sparkles, minW: 3, minH: 7, defW: 4, defH: 8,
     render: ctx => <EmotionRadarCard ctx={ctx} />,
@@ -281,20 +300,26 @@ export function minSizeOf(t: WidgetType): { w: number; h: number } {
 }
 
 /** 默认布局 — 用户定稿 v2(2026-09-27): 顶部通栏 → 中段四列等高(分布/雷达/趋势/梯队 各8行) → 双热度+右侧监控高栏 → 四榜单。
+ * v3(2026-11-03): 通栏下方新增「决策辅助」四列(盘前简报/大盘择时/情绪周期/风险雷达 各9行),
+ *   按用户要求排在情绪雷达**之上** —— 先看方向与系数, 再看情绪结构。
  * 坐标必须是竖直压实后的稳定形态(列内不留空隙), 否则 RGL 渲染时会自动上提,
  * 导致「恢复默认」的 JSON 等值判断永不成立、每次都落 blob 而非 null。 */
 export const DEFAULT_LAYOUT: DashboardItem[] = [
   { i: 'indices', t: 'indices', x: 0, y: 0, w: 12, h: 2 },
   { i: 'kpi', t: 'kpi', x: 0, y: 2, w: 12, h: 2 },
-  { i: 'distribution', t: 'distribution', x: 0, y: 4, w: 3, h: 8 },
-  { i: 'radar', t: 'radar', x: 3, y: 4, w: 3, h: 8 },
-  { i: 'trend', t: 'trend', x: 6, y: 4, w: 3, h: 8 },
-  { i: 'ladder', t: 'ladder', x: 9, y: 4, w: 3, h: 8 },
-  { i: 'concept-rank', t: 'concept-rank', x: 0, y: 12, w: 4, h: 9 },
-  { i: 'industry-rank', t: 'industry-rank', x: 4, y: 12, w: 4, h: 9 },
-  { i: 'monitor', t: 'monitor', x: 8, y: 12, w: 4, h: 22 },
-  { i: 'gainers', t: 'gainers', x: 0, y: 21, w: 2, h: 13 },
-  { i: 'losers', t: 'losers', x: 2, y: 21, w: 2, h: 13 },
-  { i: 'turnover', t: 'turnover', x: 4, y: 21, w: 2, h: 13 },
-  { i: 'activity', t: 'activity', x: 6, y: 21, w: 2, h: 13 },
+  { i: 'premarket', t: 'premarket', x: 0, y: 4, w: 3, h: 9 },
+  { i: 'timing', t: 'timing', x: 3, y: 4, w: 3, h: 9 },
+  { i: 'regime-phase', t: 'regime-phase', x: 6, y: 4, w: 3, h: 9 },
+  { i: 'global-risk', t: 'global-risk', x: 9, y: 4, w: 3, h: 9 },
+  { i: 'distribution', t: 'distribution', x: 0, y: 13, w: 3, h: 8 },
+  { i: 'radar', t: 'radar', x: 3, y: 13, w: 3, h: 8 },
+  { i: 'trend', t: 'trend', x: 6, y: 13, w: 3, h: 8 },
+  { i: 'ladder', t: 'ladder', x: 9, y: 13, w: 3, h: 8 },
+  { i: 'concept-rank', t: 'concept-rank', x: 0, y: 21, w: 4, h: 9 },
+  { i: 'industry-rank', t: 'industry-rank', x: 4, y: 21, w: 4, h: 9 },
+  { i: 'monitor', t: 'monitor', x: 8, y: 21, w: 4, h: 22 },
+  { i: 'gainers', t: 'gainers', x: 0, y: 30, w: 2, h: 13 },
+  { i: 'losers', t: 'losers', x: 2, y: 30, w: 2, h: 13 },
+  { i: 'turnover', t: 'turnover', x: 4, y: 30, w: 2, h: 13 },
+  { i: 'activity', t: 'activity', x: 6, y: 30, w: 2, h: 13 },
 ]

@@ -35,6 +35,21 @@ def list_alerts(
     events = alert_store.list_recent(
         _data_dir(request), days=days, limit=limit, source=source, type=type,
     )
+    # v0.3.30 之前落盘的事件没有 name 字段 (模拟盘自动跟单/成交), 读时按 symbol 回填,
+    # 否则老记录在触发记录列表里只显示代码。只在缺失时查, 不覆盖已有名称。
+    if events:
+        try:
+            missing = {str(e.get("symbol") or "") for e in events if not e.get("name")}
+            missing.discard("")
+            if missing:
+                name_map = request.app.state.repo.get_name_map(sorted(missing))
+                for ev in events:
+                    if not ev.get("name"):
+                        nm = name_map.get(str(ev.get("symbol") or ""))
+                        if nm:
+                            ev["name"] = nm
+        except Exception:  # noqa: BLE001
+            pass
     if ext_columns and events:
         try:
             from app.api.screener import _load_ext_value_maps, _rows_with_ext

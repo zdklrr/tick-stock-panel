@@ -483,11 +483,11 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
       onClose={handleClose}
       labelledBy="strategy-builder-title"
       overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
-      panelClassName="w-[820px] max-h-[88vh] bg-surface/95 backdrop-blur-xl border border-border/50 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+      panelClassName="w-full max-w-[95vw] max-h-[88vh] bg-surface/95 backdrop-blur-xl border border-border/50 rounded-2xl shadow-2xl flex flex-col overflow-hidden sm:w-[820px]"
     >
 
-          {/* 标题 */}
-          <div className="grid grid-cols-[1fr_auto_1fr] items-center px-5 py-2.5 border-b border-border/50">
+          {/* 标题 (窄屏换行: 原来的 1fr_auto_1fr 三栏在手机上会把标题压成竖排) */}
+          <div className="flex flex-wrap items-center gap-2 px-3 py-2.5 border-b border-border/50 sm:grid sm:grid-cols-[1fr_auto_1fr] sm:px-5">
             {/* 左侧：Tab 切换 */}
             <div className="flex rounded-lg bg-elevated p-0.5 w-fit">
               <button onClick={() => { setTab('ai'); if (mode === 'create') setSource('ai') }} className={cn('px-3 py-1 rounded-md text-xs font-medium transition-all cursor-pointer', tab === 'ai' ? 'bg-amber-400/15 text-amber-400' : 'text-muted hover:text-foreground')}>
@@ -498,11 +498,11 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
               </button>
             </div>
             {/* 中间：标题 */}
-            <span id="strategy-builder-title" className="text-sm font-semibold text-foreground">
+            <span id="strategy-builder-title" className="text-sm font-semibold text-foreground sm:justify-self-center">
               {mode === 'modify' ? '修改策略' : '创建策略'}
             </span>
             {/* 右侧：步骤 + 关闭 */}
-            <div className="flex items-center justify-end gap-2">
+            <div className="ml-auto flex items-center justify-end gap-2 sm:ml-0">
               {tab === 'ai' && (
                 <div className="flex items-center gap-1">
                   <span className={'w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ' + (step === 1 ? 'bg-amber-400/20 text-amber-400' : 'bg-emerald-400/20 text-emerald-400')}>1</span>
@@ -540,7 +540,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
           </div>
 
           {/* 内容 */}
-          <div className="flex-1 overflow-y-auto px-5 py-5 space-y-4">
+          <div className="flex-1 overflow-y-auto px-3 py-4 space-y-4 sm:px-5 sm:py-5">
             {tab === 'ai' ? (<>
             {aiStatus && !aiStatus.configured && (
               <div className="rounded-xl border border-amber-400/30 bg-amber-400/5 px-4 py-3 flex items-center gap-3">
@@ -740,7 +740,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
             ) : (
               /* 自定义编写 */
               <div className="space-y-4">
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                   <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="策略名称，如：我的xx策略"
                     className="h-9 px-3 rounded-lg bg-base border-0 ring-1 ring-border/30 text-sm font-medium text-foreground placeholder:text-muted/30 focus:outline-none focus:ring-2 focus:ring-accent/30" />
                   <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="一句话描述策略逻辑"
@@ -768,13 +768,13 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                     value={code}
                     onChange={e => { setCode(e.target.value); setValidated(false) }}
                     spellCheck={false}
-                    className="w-full h-[420px] rounded-xl border border-border/40 bg-base p-4 text-[11px] leading-relaxed font-mono text-foreground/80 resize-none focus:outline-none focus:ring-2 focus:ring-accent/30"
+                    className="w-full h-[40vh] min-h-[220px] rounded-xl border border-border/40 bg-base p-4 text-[11px] leading-relaxed font-mono text-foreground/80 resize-none focus:outline-none focus:ring-2 focus:ring-accent/30 sm:h-[420px]"
                   />
                   <div className="text-[11px] text-muted leading-relaxed">
                     新建自定义策略会保存到 <code className="px-1 py-0.5 rounded bg-base text-xs font-mono text-foreground/80">data/strategies/custom/</code>；修改已有策略会保存回原文件。
                   </div>
                   {error && <div className="text-[11px] text-danger bg-danger/10 border border-danger/20 rounded-lg px-3 py-2">{error}</div>}
-                  <div className="flex items-center justify-end gap-2">
+                  <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
                     <button onClick={() => { setCode(executionBackend === 'matrix_native' ? MATRIX_TEMPLATE : CUSTOM_TEMPLATE); setStrategyId(''); setSource('custom'); setValidated(false) }}
                       className="h-8 px-3 rounded-lg border border-border text-xs text-secondary hover:text-foreground">
                       使用模板

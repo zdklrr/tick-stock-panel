@@ -18,8 +18,9 @@
   - 即时单: 盘中由行情轮询钩子按最新快照价成交 (evaluate_intraday);
   - next_open / close 单: 盘后管道 settle_day 按当日 raw_open / raw_close 成交;
   - T+1: 当日买入次一交易日方可卖 (lots 按 buy_date 记账, available = date < today);
-  - 涨跌停: 触及涨停的买单 / 跌停的卖单默认拒单 (expired 留痕); 账户开启
-    queue_limit_orders 后转「排队次日重试」(转 next_open, 计顺延, 超限过期);
+  - 涨跌停: 触及涨停的买单 / 跌停的卖单默认转「排队次日重试」(转 next_open, 计顺延,
+    超限过期)。这是默认口径: 涨停板买不进、跌停板卖不掉符合真实交易逻辑, 用户
+    可显式 queue_limit_orders=False 退回「直接拒单」(expired 留痕);
   - 停牌/缺行情: 顺延, 连续顺延超过 max_postpone 日自动过期;
   - 除权: 按 ex_factor 调整持仓数量(乘 factor)与成本(除以 factor), 台账记 corp_action;
     现金分红金额不在因子数据中, 不处理。
@@ -31,6 +32,7 @@ import logging
 import re
 import shutil
 import threading
+import time
 import uuid
 from datetime import date as _date
 from datetime import datetime
@@ -60,9 +62,16 @@ MAX_POSTPONE_DAYS = 3             # 顺延上限: 连续 N 个交易日无法成
 _SESSION_OPEN = _time(9, 30)
 _SESSION_CLOSE = _time(15, 0)
 LOT_SIZE = 100                     # 一手 100 股 (股票/ETF 同)
-MAX_POSITION_SYMBOLS = 50          # 持仓标的数上限 (防误操作)
+#: 持仓标的数上限的兜底默认值 —— **默认不启用**, 只有调用方显式传
+#: create_order(max_position_symbols=...) 时才生效。仓位改由策略与风险自然收敛,
+#: 不再靠一个人为设定的只数闸门。常量本身保留: paper_execution 插件把它当作
+#: 「最大持仓数」参数的合法上界。
+MAX_POSITION_SYMBOLS = 50
 DEFAULT_ACCOUNT_ID = "default"
 _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+# 存量账户 queue_limit_orders 默认开启的一次性迁移标记 (data_dir 下)
+QUEUE_LIMIT_MIGRATION_FLAG = ".queue_limit_migrated_v1"
 
 _MIGRATION_DONE = False
 
@@ -165,7 +174,7 @@ def create_account(
     commission_pct: float = DEFAULT_COMMISSION_PCT,
     stamp_tax_pct: float = DEFAULT_STAMP_TAX_PCT,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
-    queue_limit_orders: bool = False,
+    queue_limit_orders: bool = True,
 ) -> dict:
     """创建账户 (同 id 已存在则原样返回, 不覆盖 — 幂等)。"""
     validate_account_id(account_id)
@@ -260,6 +269,44 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
         return acc
 
 
+def migrate_queue_limit_defaults(data_dir: Path) -> int:
+    """一次性迁移: 把存量账户的 queue_limit_orders 从 false 改成 true。
+
+    用户反馈「涨停板也能买进去不符合逻辑」—— 新账户默认已开启, 但存量账户
+    (用户已有多个比赛账户) 需要同样修正, 否则口径不一致。用
+    data_dir/.queue_limit_migrated_v1 标记保证只跑一次 (幂等); 标记文件写入失败
+    不影响迁移本身 (下次启动重跑也是幂等的)。返回实际改动的账户数。
+    """
+    root = Path(data_dir)
+    flag = root / QUEUE_LIMIT_MIGRATION_FLAG
+    with PAPER_LOCK:
+        if flag.exists():
+            return 0
+        try:
+            account_ids = list_account_ids(root)
+        except Exception as e:  # noqa: BLE001 — 数据目录不可读时不影响主流程
+            logger.warning("queue_limit_orders 迁移读取账户列表失败: %s", e)
+            return 0
+        changed = 0
+        for aid in account_ids:
+            try:
+                acc = get_account(root, aid)
+                if acc is None or acc.get("queue_limit_orders") is True:
+                    continue
+                acc["queue_limit_orders"] = True
+                save_account(root, acc, aid)
+                changed += 1
+            except Exception as e:  # noqa: BLE001 — 单账户迁移失败不阻断其它账户
+                logger.warning("queue_limit_orders 迁移失败 account=%s: %s", aid, e)
+        try:
+            atomic_write_text(flag, _now_iso())
+        except Exception as e:  # noqa: BLE001 — 标记失败只是下次重跑 (仍幂等)
+            logger.warning("queue_limit_orders 迁移标记写入失败 (下次重跑): %s", e)
+        if changed:
+            logger.info("queue_limit_orders 默认开启迁移: 修正 %d 个账户", changed)
+        return changed
+
+
 def delete_account(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, *, force: bool = False) -> tuple[dict | None, str | None]:
     """删除账户及其全部数据 (台账/持仓/净值/规则, 不可恢复)。
 
@@ -286,6 +333,107 @@ def delete_account(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, *, forc
         if root.exists():
             shutil.rmtree(root)
         return {"holdings": holdings, "pending_orders": pending}, None
+
+
+def _count_orders(root: Path) -> int:
+    d = root / "orders"
+    return len(list(d.glob("*.json"))) if d.exists() else 0
+
+
+def _drop_alerts_of(data_dir: Path, account_id: str) -> int:
+    """清掉 alerts.jsonl 里属于该账户的记录 (按 account_id 过滤, 其余账户保留)。
+
+    老成交事件没写 account_id 字段 (多账户之前只可能有 default), 重置 default 时
+    一并算作本账户 —— 否则默认账户重置后旧成交告警还挂在监控中心里。
+    """
+    p = data_dir / "user_data" / "alerts.jsonl"
+    if not p.exists():
+        return 0
+    kept: list[str] = []
+    removed = 0
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                ev = json.loads(s)
+            except Exception:  # noqa: BLE001 — 坏行原样保留, 不因一行损坏丢掉整个台账
+                kept.append(s)
+                continue
+            owner = ev.get("account_id") if isinstance(ev, dict) else None
+            legacy_default = owner is None and account_id == DEFAULT_ACCOUNT_ID
+            if owner == account_id or legacy_default:
+                removed += 1
+            else:
+                kept.append(s)
+    except Exception as e:  # noqa: BLE001 — 告警清理失败不影响账户重置
+        logger.warning("paper 重置清理告警失败 (忽略): %s", e)
+        return 0
+    if not removed:
+        return 0
+    try:
+        atomic_write_text(p, "\n".join(kept) + ("\n" if kept else ""))
+    except Exception as e:  # noqa: BLE001 — 同上
+        logger.warning("paper 重置写回告警失败 (忽略): %s", e)
+        return 0
+    return removed
+
+
+def reset_account(
+    data_dir: Path,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    *,
+    keep_rules: bool = True,
+) -> tuple[dict | None, str | None]:
+    """重置账户: 清空订单/成交/持仓/净值/计划(/告警), 现金回初始资金, 状态回 active。
+
+    keep_rules=True (默认) 保留 auto_rules 与 plan_config — 用户重置的是「账」而不是
+    「策略配置」; keep_rules=False 连规则配置一起清。返回 (统计, None) 或 (None, 原因)。
+    """
+    with PAPER_LOCK:
+        acc = get_account(data_dir, account_id)
+        if acc is None:
+            return None, "账户不存在"
+        root = accounts_base(data_dir) / validate_account_id(account_id)
+        cleared = {
+            "orders": _count_orders(root),
+            "fills": len(load_fills(data_dir, account_id)),
+            "positions": sum(1 for p in load_positions(data_dir, account_id).values() if p.get("qty")),
+            "nav": len(load_nav(data_dir, account_id)),
+            "plans": 0,
+            "alerts": 0,
+            "auto_rules": 0,
+        }
+        plans_dir = root / "plans"
+        if plans_dir.exists():
+            cleared["plans"] = len(list(plans_dir.glob("*.json")))
+            shutil.rmtree(plans_dir, ignore_errors=True)
+        for sub in ("orders", "nav"):
+            d = root / sub
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+        for name in ("fills.jsonl", "positions.json"):
+            f = root / name
+            if f.exists():
+                f.unlink(missing_ok=True)
+        if not keep_rules:
+            rules_dir = root / "auto_rules"
+            if rules_dir.exists():
+                cleared["auto_rules"] = len(list(rules_dir.glob("*.json")))
+                shutil.rmtree(rules_dir, ignore_errors=True)
+            cfg = root / "plan_config.json"
+            if cfg.exists():
+                cfg.unlink(missing_ok=True)
+        cleared["alerts"] = _drop_alerts_of(data_dir, account_id)
+
+        acc["cash"] = float(acc.get("initial_cash") or 0.0)
+        acc["status"] = "active"
+        acc["reset_at"] = _now_iso()
+        save_account(data_dir, acc, account_id)
+        _materialize(data_dir, account_id)
+        logger.info("paper 账户已重置: %s 清空 %s", account_id, cleared)
+        return {"account": acc, "cleared": cleared}, None
 
 
 # ── 费用 (纯函数) ───────────────────────────────────────
@@ -377,11 +525,17 @@ def create_order(
     asset_type: str | None = None,
     ref_price: float | None = None,
     source: str = "manual",
+    max_position_symbols: int | None = None,
+    name: str | None = None,
 ) -> tuple[dict | None, str | None]:
     """创建订单并校验。qty 与 amount 二选一 (amount 按参考价折算百股)。
 
     order_type: market(即时, 盘中钩子撮合) / next_open / close。
     ETF 即时单自动转 next_open (盘中钩子只喂股票快照)。
+    max_position_symbols: 新开仓的持仓标的数上限; None(默认) 表示不限制, 只有
+    调用方显式要求时才生效 (人工单与交易计划都不设限, 仓位交给策略与风险决定)。
+    name: 股票名称快照。下单时若已知就随订单落盘, 成交后再进持仓 —— 维表
+    残缺 (曾被降级源冲成只剩沪市) 时持仓仍能显示中文名, 不依赖实时维表查询。
     返回 (order, None) 或 (None, 错误信息)。
     """
     with PAPER_LOCK:
@@ -435,18 +589,25 @@ def create_order(
                     f"已有待成交卖出 {pending_sell}, 请求数量 {qty}"
                 )
 
-        # 持仓标的数上限 (仅新开仓的买入; 加仓已有持仓不受限)
-        positions = load_positions(data_dir, account_id)
-        if (
-            side == "buy"
-            and symbol not in positions
-            and len([p for p in positions.values() if p["qty"] > 0]) >= MAX_POSITION_SYMBOLS
-        ):
-            return None, f"持仓标的数已达上限 {MAX_POSITION_SYMBOLS}, 不能再开新仓"
+        # 持仓标的数上限: 仅当调用方显式要求时生效 (None=不限制, 加仓已有持仓不受限)
+        cap = max_position_symbols
+        if cap is not None:
+            try:
+                cap = int(cap)
+            except (TypeError, ValueError):
+                cap = None
+        if cap is not None and cap > 0 and side == "buy":
+            positions = load_positions(data_dir, account_id)
+            if (
+                symbol not in positions
+                and len([p for p in positions.values() if p["qty"] > 0]) >= cap
+            ):
+                return None, f"持仓标的数已达上限 {cap}, 不能再开新仓"
 
         order = {
             "id": _new_id("order"),
             "symbol": symbol,
+            "name": (name or "").strip() or None,
             "asset_type": asset_type,
             "side": side,
             "qty": qty,
@@ -547,6 +708,10 @@ def replay_positions(
                 "asset_type": f.get("asset_type", "stock"),
                 "qty": 0, "avg_cost": 0.0, "available_qty": 0, "lots": [],
             })
+            # 名称快照随成交落进持仓: 老台账没有 name 字段 → 保持原值不变
+            name = (f.get("name") or "").strip()
+            if name and not pos.get("name"):
+                pos["name"] = name
             total_cost = pos["avg_cost"] * pos["qty"] + qty * price + fee
             pos["qty"] += qty
             pos["avg_cost"] = round(total_cost / pos["qty"], 6) if pos["qty"] else 0.0
@@ -707,6 +872,7 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
         "date": day,
         "order_id": order["id"],
         "symbol": symbol,
+        "name": (order.get("name") or "").strip() or None,
         "asset_type": asset_type,
         "side": side,
         "qty": qty,
@@ -752,6 +918,17 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
     except Exception as e:
         logger.warning("paper 成交告警落盘失败 (不影响账务): %s", e)
 
+    # 0.3.35: 自动跟单买入成交后, 若账户没有该标的的活跃计划则补建一份
+    # (持仓表止损/目标列的数据来源; source="auto")。软失败, 不影响成交。
+    if side == "buy" and str(order.get("source") or "").startswith("auto"):
+        from app.strategy import paper_plans as _pp
+        _pp.ensure_plan_for_fill(
+            data_dir, account_id, symbol, price, qty,
+            # 0.3.47: 订单自带 name 就随计划落盘, 否则计划表「代码/名称」只剩代码
+            name=(str(order.get("name") or "").strip() or None),
+            note=f"自动跟单买入成交后补建 (order {order['id']})",
+        )
+
     logger.info("paper filled: %s %s %d x %.3f fee %.2f", side, symbol, qty, price, fee)
     return fill
 
@@ -785,19 +962,27 @@ def day_fill_events(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_
     盘后结算路径 (daily_pipeline paper_settle) 用它把结算成交留痕到告警中心;
     盘中即时成交走 evaluate_intraday 返回值, 不经过本函数。
     """
+    acc = get_account(data_dir, account_id)
+    acc_name = str((acc or {}).get("name") or account_id) if acc is not None else ""
     return [
-        _fill_event(f, account_id)
+        _fill_event(f, account_id, account_name=acc_name)
         for f in load_fills(data_dir, account_id)
         if f.get("date") == day and f.get("kind") == "fill"
     ]
 
 
-def _fill_event(fill: dict, account_id: str) -> dict:
+def _fill_event(fill: dict, account_id: str, account_name: str = "") -> dict:
     """成交台账行 → 推送事件。字段对齐监控告警 (AlertEvent), 供 SSE toast /
     语音播报 / 系统通知 / alert_store 留痕 / Webhook 复用, 前端无需新管道。
     ts 用 fill.seq (毫秒), 与 alert_store 的 ts 口径一致; 文案用中文可读措辞。
     """
     side_label = "买入" if fill["side"] == "buy" else "卖出"
+    acc_label = str(account_name or "").strip()
+    message = (
+        f"[{acc_label}] 模拟盘{side_label}成交 {fill['qty']}股 @ {fill['price']:.2f}"
+        if acc_label
+        else f"模拟盘{side_label}成交 {fill['qty']}股 @ {fill['price']:.2f}"
+    )
     return {
         "source": "paper",
         "type": "fill",
@@ -808,7 +993,8 @@ def _fill_event(fill: dict, account_id: str) -> dict:
         "qty": fill["qty"],
         "price": fill["price"],
         "account_id": account_id,
-        "message": f"模拟盘{side_label}成交 {fill['qty']}股 @ {fill['price']:.2f}",
+        "account_name": acc_label or account_id,
+        "message": message,
     }
 
 
@@ -818,9 +1004,15 @@ def evaluate_intraday(data_dir: Path, snapshot: dict[str, float], account_id: st
     snapshot: {symbol: raw 最新价} (来自 enriched raw_close)。仅处理 market 单;
     调用方 (quote_service) 已保证交易时段。ETF 不在快照内自然顺延。
     事件由调用方广播 (SSE/语音/系统通知/留痕/Webhook), 域模块只产出不投递。
+
+    冻结 (status != "active") 账户直接跳过: 「停止」语义必须连已挂出的 pending
+    单一起暂停撮合, 否则停止按钮只挡住新订单而不挡存量单。
     """
     events: list[dict] = []
     with PAPER_LOCK:
+        acc = get_account(data_dir, account_id)
+        if acc is None or acc.get("status") != "active":
+            return events
         today = cn_today().isoformat()
         pending_orders = sorted(
             (o for o in load_orders(data_dir, account_id) if o["status"] == "pending" and o["order_type"] == "market"),
@@ -832,7 +1024,10 @@ def evaluate_intraday(data_dir: Path, snapshot: dict[str, float], account_id: st
                 continue  # 无快照顺延
             fill = _fill_order(data_dir, order, float(price), today, account_id)
             if fill is not None:
-                events.append(_fill_event(fill, account_id))
+                events.append(_fill_event(
+                    fill, account_id,
+                    account_name=str(acc.get("name") or account_id),
+                ))
     return events
 
 
@@ -881,6 +1076,105 @@ def _prev_close(data_dir: Path, symbol: str, asset_type: str, day: str) -> float
     if df.is_empty() or df["close"][0] is None:
         return None
     return float(df["close"][0])
+
+
+# ── 展示估值价 (最近日线收盘 + 昨收) ─────────────────────
+#: 最近收盘价缓存: (表名, 最近分区名元组) → (写入时刻, {symbol: {date,last,prev}})
+_HIST_CACHE: dict[tuple[str, tuple[str, ...]], tuple[float, dict[str, dict]]] = {}
+_HIST_CACHE_TTL = 30.0
+_HIST_CACHE_LOCK = threading.Lock()
+
+
+def _recent_daily_files(base: Path, lookback: int) -> tuple[list[str], tuple[str, ...]]:
+    """最近 lookback 个日期分区的 part.parquet (按分区名排序取尾部)。"""
+    if not base.exists():
+        return [], ()
+    try:
+        parts = sorted(p for p in base.iterdir() if p.is_dir() and p.name.startswith("date="))
+    except Exception as e:  # noqa: BLE001 — 目录不可读按无数据处理
+        logger.warning("paper 日线分区列举失败 %s: %s", base, e)
+        return [], ()
+    tail = parts[-lookback:]
+    files = [str(p / "part.parquet") for p in tail if (p / "part.parquet").exists()]
+    return files, tuple(p.name for p in tail)
+
+
+def _table_close_history(data_dir: Path, table: str, lookback: int) -> dict[str, dict]:
+    """单表最近若干交易日的 raw close: {symbol: {date, last, prev}}。
+
+    只扫尾部 lookback 个日期分区 (不扫全表), 结果按 (表, 分区名) 缓存 —— 21 个
+    模拟账户 /compare 共用一份, 不会把全表扫描放大 21 次。
+    """
+    base = data_dir / table
+    files, sig = _recent_daily_files(base, lookback)
+    if not files:
+        return {}
+    key = (table, sig)
+    now = time.monotonic()
+    with _HIST_CACHE_LOCK:
+        hit = _HIST_CACHE.get(key)
+        if hit is not None and now - hit[0] < _HIST_CACHE_TTL:
+            return hit[1]
+    try:
+        df = (
+            scan_daily_parquet(files)
+            .select(["symbol", "date", "close"])
+            .filter(pl.col("close").is_not_null())
+            .sort(["symbol", "date"])
+            .group_by("symbol", maintain_order=True)
+            .agg(
+                pl.col("date").last().alias("date"),
+                pl.col("close").tail(2).alias("closes"),
+            )
+            .collect()
+        )
+    except Exception as e:  # noqa: BLE001 — 估值属展示口径, 读失败降级成本价
+        logger.warning("paper 最近收盘价读取失败 %s: %s", table, e)
+        return {}
+    out: dict[str, dict] = {}
+    for row in df.iter_rows(named=True):
+        closes = row["closes"] or []
+        if not closes:
+            continue
+        last = closes[-1]
+        prev = closes[-2] if len(closes) >= 2 else None
+        if last is None:
+            continue
+        out[str(row["symbol"])] = {
+            "date": str(row["date"]) if row["date"] is not None else None,
+            "last": float(last),
+            "prev": float(prev) if prev is not None else None,
+        }
+    with _HIST_CACHE_LOCK:
+        _HIST_CACHE[key] = (now, out)
+    return out
+
+
+def recent_close_history(
+    data_dir: Path,
+    symbols: list[str] | None = None,
+    asset_types: dict[str, str] | None = None,
+    *,
+    lookback: int = 6,
+) -> dict[str, dict]:
+    """最近收盘价 + 昨收 (展示估值口径): {symbol: {date, last, prev}}。
+
+    etf 标的取 kline_etf_daily, 其余取 kline_daily; 两表都有的标的按 asset_type
+    定权威表, 避免把 510300 这类同码 ETF 与股票口径混用。
+    """
+    asset_types = asset_types or {}
+    stock_hist = _table_close_history(data_dir, "kline_daily", lookback)
+    etf_hist = _table_close_history(data_dir, "kline_etf_daily", lookback)
+    out: dict[str, dict] = {}
+    for sym, row in stock_hist.items():
+        out[sym] = row
+    for sym, row in etf_hist.items():
+        if asset_types.get(sym) == "etf" or sym not in out:
+            out[sym] = row
+    if symbols is not None:
+        want = set(symbols)
+        out = {s: v for s, v in out.items() if s in want}
+    return out
 
 
 def _index_close(data_dir: Path, day: str) -> float | None:
@@ -954,11 +1248,14 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
     market 单 (当日无快照) 也按 raw_close 兜底成交 — 避免停牌外无限顺延。
     当日开盘后才下 / 排队的 next_open 单, 以及收盘后才下的 close / market 单,
     当日不成交也不计顺延, 留到下一交易日 (见 _placed_after_price_time)。
+
+    冻结 (status != "active") 账户整体跳过: 停止的账户不撮合顺延单、不做除权、
+    不写净值, 保持停牌前状态直到用户重新启动。
     """
     summary = {"filled": 0, "expired": 0, "corp_actions": 0, "nav": None, "account": account_id}
     with PAPER_LOCK:
         acc = get_account(data_dir, account_id)
-        if acc is None:
+        if acc is None or acc.get("status") != "active":
             return summary
         pending_orders = sorted(
             (o for o in load_orders(data_dir, account_id) if o["status"] == "pending"),
@@ -1093,32 +1390,109 @@ def load_nav(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]
     return out
 
 
-def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
-    """总览 (盘中实时估算): 现金 + 持仓市值 + 估算净值。"""
+def overview(
+    data_dir: Path,
+    price_map: dict[str, float] | None = None,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    *,
+    valuation: str = "cost",
+) -> dict:
+    """总览: 现金 + 持仓市值 + 估算净值。
+
+    估值口径由 valuation 决定 (三者优先级: price_map > valuation='daily' > 成本价):
+      - 传 price_map: 盘中实时快照价 (estimating=True) —— 优先级最高, 保持旧契约;
+      - valuation='daily': 用最近一根日线 raw close 估值, 同时给出「今日盈亏」
+        (昨收 → 最新价)。展示层 (API) 用这个口径, 非交易时段不会再退回成本价;
+      - valuation='cost' (默认): 成本价兜底 —— 内部调用方 (计划/结算) 沿用旧口径,
+        避免本改动影响建计划的股数计算。
+    """
     acc = get_account(data_dir, account_id)
     if acc is None:
         return {"initialized": False}
     positions = load_positions(data_dir, account_id)
+
+    # 盘中实时口径同样要读日线: 实时快照只给「现价」, 没有「昨收」就算不出
+    # 每只持仓的今日盈亏 —— 那正是持仓表「今日盈亏」列恒为 `--` 的原因。
+    hist: dict[str, dict] = {}
+    if positions and (valuation == "daily" or price_map is not None):
+        asset_types = {s: p.get("asset_type", "stock") for s, p in positions.items() if p["qty"] > 0}
+        try:
+            hist = recent_close_history(data_dir, list(asset_types), asset_types)
+        except Exception as e:  # noqa: BLE001 — 估值属展示口径, 读取失败降级成本价
+            logger.warning("paper overview 最近收盘价不可用, 降级成本价: %s", e)
+            hist = {}
+
     today = cn_today().isoformat()
     holdings = []
     mv = 0.0
+    day_pnl = 0.0
+    day_pnl_known = False
     for symbol, pos in sorted(positions.items()):
         if pos["qty"] <= 0:
             continue
         price = (price_map or {}).get(symbol)
+        info = hist.get(symbol) or {}
+        if price is None:
+            price = info.get("last")
         last = price if price is not None else pos["avg_cost"]
+        priced = price is not None
+        # 昨收: 实时价对应「上一个交易日的收盘」; 日线口径则取倒数第二根。
+        # 日线最新一根若就是今天(盘中未定型 bar), 昨收要退到再前一根。
+        if price_map is not None:
+            prev = info.get("prev") if str(info.get("date")) >= today else info.get("last")
+        else:
+            prev = info.get("prev")
         mv += pos["qty"] * last
+        row_day_pnl = None
+        if prev and prev > 0:
+            row_day_pnl = round(pos["qty"] * (last - prev), 2)
+            day_pnl += pos["qty"] * (last - prev)
+            day_pnl_known = True
         holdings.append({
             "symbol": symbol,
+            "name": pos.get("name") or None,
             "asset_type": pos.get("asset_type", "stock"),
             "qty": pos["qty"],
             "avg_cost": pos["avg_cost"],
             "last_price": round(last, 4),
+            "price_date": info.get("date") if price_map is None else None,
+            "priced": priced,
             "market_value": round(pos["qty"] * last, 2),
             "pnl": round(pos["qty"] * (last - pos["avg_cost"]), 2),
             "pnl_pct": round((last / pos["avg_cost"] - 1) * 100, 2) if pos["avg_cost"] else 0.0,
+            "prev_close": round(prev, 4) if prev else None,
+            "day_pnl": row_day_pnl,
+            "day_pnl_pct": round((last / prev - 1) * 100, 2) if prev and prev > 0 else None,
             "available_qty": _available_of(pos, today),
         })
+    # 仓位占比: 分母 = 现金 + 持仓市值 (循环结束后 mv 已是终值, 这里统一补)
+    total = float(acc["cash"]) + mv
+    if total > 0:
+        for h in holdings:
+            h["position_pct"] = round(h["market_value"] / total * 100, 2)
+    else:
+        for h in holdings:
+            h["position_pct"] = 0.0
+
+    # 账户级今日盈亏: 优先用「当前总资产 − 上一交易日定版净值」(含当日已实现),
+    # 定版净值缺失时退回「持仓浮动日盈亏之和」; 都没有则 null (前端不显示)
+    today_day_pnl: float | None = None
+    today_day_pnl_pct: float | None = None
+    if valuation == "daily" or price_map is not None:
+        prev_total = None
+        try:
+            nav_rows = [r for r in load_nav(data_dir, account_id) if r.get("date") and r["date"] < today]
+            if nav_rows:
+                prev_total = float(nav_rows[-1].get("nav") or 0) or None
+        except Exception as e:  # noqa: BLE001 — 净值序列异常不影响展示
+            logger.warning("paper overview 读净值用于今日盈亏失败: %s", e)
+        if prev_total:
+            today_day_pnl = round(total - prev_total, 2)
+            today_day_pnl_pct = round((total / prev_total - 1) * 100, 2)
+        elif day_pnl_known:
+            today_day_pnl = round(day_pnl, 2)
+
+    source = "live" if price_map is not None else ("daily" if hist else "cost")
     return {
         "initialized": True,
         "account_id": account_id,
@@ -1130,7 +1504,10 @@ def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_
         "total": round(float(acc["cash"]) + mv, 2),
         "total_pnl": round(float(acc["cash"]) + mv - float(acc["initial_cash"]), 2),
         "initial_cash": float(acc["initial_cash"]),
+        "day_pnl": today_day_pnl,
+        "day_pnl_pct": today_day_pnl_pct,
         "estimating": price_map is not None,
+        "price_source": source,
         "holdings": holdings,
     }
 

@@ -17,6 +17,7 @@ import { useCustomSignalNames } from '@/lib/useCustomSignalNames'
 import { strategyEventMeta, strategyName } from '@/lib/strategyMonitorEvents'
 import { boardTag } from '@/components/stock-table/primitives'
 import { toNavItems, type NavItem } from '@/lib/listNav'
+import { filterNoiseAlerts, useMonitorNoise } from '@/lib/storage'
 import { fmtPrice, fmtIndexPct, fmtStockPct, pctClass, scoreColor as scoreColorValue, SectionTitle } from './shared'
 
 // 切股导航列表构建 (与列表展示行一致: StockList 只显示前 8)
@@ -368,9 +369,14 @@ const _SOURCE_BADGE: Record<string, string> = {
   price: 'bg-emerald-400/10 text-emerald-400',
   market: 'bg-purple-500/10 text-purple-400',
   sector: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+  paper: 'bg-sky-400/10 text-sky-500 dark:text-sky-300',
 }
 const _SOURCE_LABEL: Record<string, string> = {
-  strategy: '策略', signal: '信号', price: '价格', market: '异动', sector: '板块',
+  strategy: '策略', signal: '信号', price: '价格', market: '异动', sector: '板块', paper: '模拟盘',
+}
+/** 模拟盘事件 (source=paper) 的二级标签, 与监控中心列表保持一致 */
+const _PAPER_TYPE_LABEL: Record<string, string> = {
+  auto_order: '自动跟单', fill: '成交', paper_fill: '成交', plan_buy: '计划买入', plan_sell: '计划卖出',
 }
 const _SEVERITY_BAR: Record<string, string> = {
   info: 'bg-accent/40', warn: 'bg-warning', critical: 'bg-danger',
@@ -382,18 +388,24 @@ export function MonitorWidget({ onStockClick, activeSymbol }: {
 }) {
   const navigate = useNavigate()
   const customNames = useCustomSignalNames()
+  // 噪音过滤: 与监控中心共用同一份偏好 (设置里改一处, 三处同时生效)
+  const [noisePref] = useMonitorNoise()
   const alerts = useQuery({
     queryKey: ['alerts', ''],
     queryFn: () => api.alertsList({ days: 7, limit: 10 }),
     refetchInterval: 10000,
   })
-  const events: AlertEvent[] = alerts.data?.alerts ?? []
+  const allEvents: AlertEvent[] = alerts.data?.alerts ?? []
+  const events = filterNoiseAlerts(allEvents, noisePref)
+  const hiddenCount = allEvents.length - events.length
   // 切股导航列表: 有 symbol 的触发记录
   const alertNav = toNavItems(events.filter((ev): ev is AlertEvent & { symbol: string } => !!ev.symbol))
 
   if (events.length === 0) {
     return (
-      <div className="mt-1 py-6 text-center text-[11px] text-muted">暂无触发记录</div>
+      <div className="mt-1 py-6 text-center text-[11px] text-muted">
+        {hiddenCount > 0 ? `已隐藏 ${hiddenCount} 条模拟盘噪音记录` : '暂无触发记录'}
+      </div>
     )
   }
 
@@ -481,7 +493,9 @@ export function MonitorWidget({ onStockClick, activeSymbol }: {
                 <>
                   <div className="mt-0.5 flex items-center gap-1.5">
                     <span className={cn('shrink-0 rounded px-1 py-px text-[8px] font-medium', _SOURCE_BADGE[ev.source] ?? 'bg-elevated text-muted')}>
-                      {_SOURCE_LABEL[ev.source] ?? ev.source}
+                      {ev.source === 'paper'
+                        ? _PAPER_TYPE_LABEL[ev.type] ?? _SOURCE_LABEL.paper
+                        : _SOURCE_LABEL[ev.source] ?? ev.source}
                     </span>
                     {ev.message && (
                       <span className="text-[9px] text-muted truncate flex-1">{ev.message}</span>
