@@ -239,3 +239,40 @@ def test_lookup_names_online_never_raises_on_failure(monkeypatch) -> None:
     assert isync.lookup_names_online(["300007.SZ"]) == {}
     isync._name_lookup_cache.clear()
 
+
+def test_daily_price_limits_are_not_inherited_from_old_metadata(tmp_path, monkeypatch):
+    _write_existing(tmp_path)
+    # 关键修复: 返回至少 2 个 symbol (= 现有 2 行)。若只返回 1 行, 缩表护栏
+    # 会因「新源 1 行 < 现有 2 行」拒绝写入, 维表根本不更新, limit_up/limit_down
+    # 仍为旧值, limit_up is None 的断言就会失败。给足行数让写入正常进行。
+    monkeypatch.setattr(
+        isync, "_fetch_instruments_via_provider",
+        lambda: _provider_rows("600000.SH", "000001.SZ"),
+    )
+
+    isync.sync_instruments(tmp_path)
+    row = pl.read_parquet(tmp_path / "instruments/instruments.parquet").row(0, named=True)
+    assert row["float_shares"] == pytest.approx(2.9e10)
+    assert row["limit_up"] is None
+    assert row["limit_down"] is None
+
+
+@pytest.mark.parametrize(("mode", "current_limits"), [("none", False), ("free", False), ("api_key", True)])
+def test_only_paid_metadata_can_supply_todays_price_limits(tmp_path, monkeypatch, mode, current_limits):
+    from types import SimpleNamespace
+
+    from app.tickflow import client
+
+    item = {"symbol": "002172.SZ", "name": "澳洋健康", "ext": {
+        "limit_up": 6.50, "limit_down": 5.32, "float_shares": 765140730.0,
+    }}
+    monkeypatch.setattr(isync, "_fetch_instruments_via_provider", lambda: None)
+    monkeypatch.setattr(isync, "get_client", lambda: SimpleNamespace(
+        exchanges=SimpleNamespace(get_instruments=lambda *args, **kwargs: [item]),
+    ))
+    monkeypatch.setattr(client, "current_mode", lambda: mode)
+    isync.sync_instruments(tmp_path)
+    row = pl.read_parquet(tmp_path / "instruments/instruments.parquet").row(0, named=True)
+    assert row["limit_up"] == (6.50 if current_limits else None)
+    assert row["limit_down"] == (5.32 if current_limits else None)
+    assert row["float_shares"] == 765140730.0

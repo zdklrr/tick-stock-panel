@@ -1,7 +1,37 @@
 # Tick Stock Panel (TSP) 桌面客户端 — 本机构建说明
 
-版本：**v0.3.47**（源码 `G:\tick_stock_panel`，上游 https://github.com/shy3130/tick-stock-panel）
+版本：**v0.3.48**（源码 `G:\TSP` = 上游 0.3.34 完整 rebase + 我们 0.3.47 全部定制；旧源码 `G:\tick_stock_panel` 保持干净的 0.3.47 不动，上游 https://github.com/shy3130/tick-stock-panel）
 
+> **v0.3.48 相对 0.3.47 的变化（完整移植上游 0.3.34 的 53 个提交，但不丢我们改过的功能）**
+>
+> 用户要求：把原项目更新的东西完善进来，但「不影响改过的功能的直接移植、会影响的列出来让我选择」，并指定「重新复制到 `G:\TSP`，在这个文件夹里改，部署到 NAS 用端口 1923，选第二项：完整 rebase 再叠加定制」。本版按此执行。
+>
+> | # | 做法 / 修法 | 影响面 |
+> |---|---|---|
+> | 1 | **先建回滚点**：把干净的 0.3.47 定制版推到用户自己的 fork `zdklrr/tick-stock-panel` 的 main（commit `5b85956942bdd5cdd969a749e97053b6ee10cdc2`）+ 轻量 tag `tsp-custom-v0.3.47`，1397 文件、逐 blob 校验 PASS。推送走 GitHub Git Data API（本机 git smart-HTTPS 长连接被网络重置），部署脚本/密钥/两份中文文档里的 NAS 密码等私有串在推送副本里做了脱敏，本地文件不动 | GitHub 回滚点 |
+> | 2 | **三方对比**：fork 基线（上游 0.3.26）之后上游有 **53 个提交 / 397 个文件变化**（新增 133 / 修改 264）；我们相对基线改了 221 个文件（新增 119 / 删除 46 / 修改 56）。逐文件三方比对得 **SAFE 369 / CONFLICT 28**（其中 5 个只是纯版本号）。GitHub compare API 的 `files` 字段硬上限 300 会截断，故用完整 tree 逐文件比对而非 compare 结果 | 移植评估 |
+> | 3 | **两条移植路径都做了真实编译裁决**：①严格按提交主题挑 242 个文件 → 切断上游代码库内部一致性（图表引擎需 lightweight-charts v5 + package.json/lock 同步、18 个后端新模块靠 main.py 注册、回测/分钟线/策略池互引），`import` 报模块缺失、前端 tsc 40+ 错，**已用 `port_rollback.py` 完整还原到干净 0.3.47**（`RESULT: CLEAN 0.3.47`，绝不把半成品留给用户）②git 全量三方合并树（369 SAFE + 17 自动文本合并 + 11 个 UU）→ 后端可 import、前端 17 个 tsc 错误。最终采用**全量合并树 + 逐个修** | 移植决策 |
+> | 4 | **11 个 UU 冲突文件全部「以上游为底、重放我们的定制」**，不是整块保留旧版：`instrument_sync.py` 同时保留我们的缩表护栏/名称在线兜底与上游的 `cn_today`/`current_limits`/涨跌停价不继承（`_SHARE_FIELDS` 合一为 `name,listing_date,total_shares,float_shares,tick_size`）；`ListColumnCustomizerInner` 取上游「显示周期 select」+ 我们的手机响应式；`StrategyBuilderDialog` 取上游一分钟策略全套 + 我们的响应式；`Screener.tsx` 以上游分钟/分组/刷新策略为底、整段移植我们的「行选择 → 生成交易计划」；`StrategyPoolDialog` 以上游 495 行分组/归档/备份恢复重写为底、**补回我们 0.3.28 的「删除策略文件」功能**（上游重写丢了它），适配新 Props；对应测试文件两边全留并新增 5 个删除测试 | 7 个 UU 精细合并 |
+> | 5 | **依赖与版本**：`lightweight-charts` 由 `^4.2.0` 升到 `5.2.1`（package.json 与 pnpm-lock 同步，镜像内 `pnpm install --frozen-lockfile` 装 v5）；补 `fancy-canvas` peer；版本号四锚点（VERSION / pyproject / `_FALLBACK_VERSION` / frontend/package.json）统一 **0.3.48** | 图表引擎升级 |
+> | 6 | **部署到 NAS 端口 1923（与现有 923 完全并行、互不干扰）**：独立 compose 目录 `/volume1/docker/TSP1923`、独立源码树、独立 data、独立镜像 `tsp1923:0.3.48`、独立容器 `TSP1923_Panel`、宿主端口 1923（容器内仍 3018）。上传脚本 `upload_1923.py` 用 tar 白名单流式传输；`rebuild_1923.py` 只对新项目 `docker compose -p tsp1923`、清镜像只匹配 `^tsp1923:` 且**禁 image prune**、绝不碰 `TickFlow_Stock_Panel` | NAS 1923 独立实例 |
+> | 7 | **上游「老功能优化升级」0 遗漏**：全树扫描上游 393 个变化文件 → `UPSTREAM_OK=363 / MERGED=30 / 丢失=0`；28 个双方都改的文件 `merged=28 / upstream_lost=0 / ours_lost=0`，21 个修复标记（Windows 白屏、覆盖升级配置丢失、Docker 路径错位、`quote_ts` 兼容、分钟早盘补缺、分时零轴对称等）全在。无需再补改，定制功能一个没动 | 优化升级核查 |
+> | 8 | **923 的 24 个 zdk 策略已复制到 1923**：27 个 .py 逐字节一致 + `POST /api/strategies/reload` → `{"ok":true,"count":24}`、`load_errors=[]`；策略池勾选状态因 0.3.47(localStorage) 与 0.3.48(服务端 v2) 存储模型不同未复制，需在新界面重勾 | NAS 1923 策略库 |
+> | 9 | **模拟盘仓位口径说明**：`当前仓位`=实时市值/总资产（随行情涨）、`计划仓位`=建计划时冻结的 `pos_pct` 之和、`今日上限`=`择时×情绪×外围` 的软建议（盘中会跳）；铁律「卖出永不受择时影响」→ 老仓可以高于今日上限，不是 bug。详见 NAS 文档专节 | 模拟盘今日决策卡 |
+>
+> > **首轮构建失败已修**：`upload_1923.py` 的排除规则里裸名 `data` 误剪掉了真实源码目录 `frontend/src/data`(ossLicenses.ts) 与 `frontend/src/components/data`(27 个模块)，导致 NAS 上 `pnpm build` 报 `TS2307 Cannot find module '@/components/data/...'`。修法：排除改为只锚定根级 `data`/`backend/data`，并把 `.dockerignore` 的裸 `data` 改成 `/data` + `/backend/data`（加注释说明）。重传后 source files 1343→**1371**（+28），二次构建 `BUILD_RC=0`。
+> >
+> > **验证（本地 G:\TSP 全绿）**：`tsc -b` **0 错误**；`vitest run --testTimeout=20000` **117 files / 849 passed**（另有 3 例上游自带 `StockPreviewDialogContent.test.tsx` 在默认 5s 并行负载下的超时脆弱性，纯净上游树自身也复现，**未改任何源码文件**）；定向 `pytest` **234 passed**；`vite build` 成功（`index-B-mju3QX.js` 352 kB）。全树行锚定扫描 **0 冲突标记**、10/10 定制功能标记存活。
+> >
+> > **验证（NAS 1923）**：`verify_1923.py` **FAILS=0**（30+ 项）：`/health`=0.3.48、`/api/data/version`=v0.3.48、`/api/risk/radar` 可用、容器/镜像/端口/挂载隔离、923 与 1923 data 目录 inode 不同且 marker 不泄漏；**923 生产容器 ID `a6c43196...`、镜像 `tsp-nas:0.3.47`、StartedAt `2026-11-10T06:35:55.888865647Z` 三项全部未变**（从未重启）。
+> >
+> > **补充｜1923 共用 923 的数据源与日K**（用户反馈「1923 还要重新配数据源下载日K」）：选「独立 + 每天自动同步」——
+> > 两实例保留各自独立 `data/`，一次性复制 923 的 `capabilities.json`/`secrets.json`/`preferences.json` 让 1923
+> > 从 `mode=none` 变 `mode=free`，再由 `/etc/cron.d/tsp1923-data-sync` 每天 **16:30（北京，避开 923 盘后管道）**
+> > 单向 rsync 923 的日K/分钟K/维表/复权/fuyao 缓存到 1923（`--ignore-existing` 取并集、维表 923 权威覆盖、
+> > 绝不同步 `auth.json`/`paper/`/锁文件、仅在有新文件时重启 1923）。`setup_data_sync.py --verify` **18/18 PASS**：
+> > 923 全程未变、1923 登录密码哈希不变、`kline_daily` 249 分区、`600000.SH` 返回「浦发银行 8 行」、
+> > 8 只抽样股票名称与行数全部平价。详见 `G:\TSP\使用说明-NAS部署.md` 的「v0.3.48 补充｜923 → 1923 数据同步」。
+>
 > **v0.3.47 相对 0.3.46 的变化（模拟盘「收起状态的今日盈亏 / 交易计划没名字 / 看不懂撮合异常」）**
 >
 > 用户反馈三件事：①模拟盘账户**收起**时那列「最新日」不显示今日盈亏；②交易计划里买的票只有代码没有中文名；③交易计划里显示「撮合失败 / 撮合异常」，看不懂是什么意思。

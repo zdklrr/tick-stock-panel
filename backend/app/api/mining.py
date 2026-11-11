@@ -20,7 +20,7 @@ from app.backtest.mining import (
     evaluate_candidate_gate,
 )
 from app.enriched_generation import EnrichedGenerationUnavailableError
-from app.factors.registry import factor_columns_view
+from app.factors.registry import missing_factor_ids
 from app.services import preferences
 from app.services.mining_jobs import (
     RUN_STATUSES,
@@ -41,9 +41,6 @@ from app.services.mining_schedule import (
 )
 
 router = APIRouter(prefix="/api/backtest/mining", tags=["backtest"])
-# 校验时动态读取 (含运行期注册的自定义/复合因子)
-def _known_factor_ids() -> frozenset[str]:
-    return frozenset(str(item["id"]) for item in factor_columns_view())
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _SSE_POLL_SECONDS = 0.5
 _SSE_HEARTBEAT_SECONDS = 15.0
@@ -90,7 +87,7 @@ class MiningStartRequest(BaseModel):
     @field_validator("factor_names")
     @classmethod
     def _known_factors(cls, values: list[str]) -> list[str]:
-        unknown = sorted(set(values) - _known_factor_ids())
+        unknown = missing_factor_ids(values)
         if unknown:
             raise ValueError(f"unknown mining factors: {unknown}")
         return values
@@ -156,11 +153,17 @@ class MiningAutoStartRequest(BaseModel):
 
 def _require_mining_lock(request: Request) -> None:
     """降级模式 (撞锁启动) 下拒绝一切挖掘启动入口, 指引到挖掘页锁状态卡。"""
-    if not getattr(request.app.state, "mining_lock_acquired", True):
+    from app.services.mining_lock_admin import MiningLockAdminError, ensure_mining_lock
+
+    try:
+        available = ensure_mining_lock(request.app.state)
+    except MiningLockAdminError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not available:
         raise HTTPException(
             status_code=409,
             detail="挖掘锁被其他进程占用, 当前后端以降级模式运行 — "
-            "请在挖掘页查看锁状态并强制释放后重试",
+            "请在挖掘页点击“检查并恢复挖掘”",
         )
 
 
@@ -175,24 +178,36 @@ def get_lock_status(request: Request) -> dict[str, Any]:
     )
 
 
+@router.post("/lock/recover")
+def recover_lock(request: Request) -> dict[str, Any]:
+    from app.services.mining_lock_admin import MiningLockAdminError, check_and_recover
+
+    try:
+        return check_and_recover(request.app.state)
+    except MiningLockAdminError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class MiningForceReleaseRequest(BaseModel):
+    expected_pid: int | None = Field(default=None, gt=0)
+
+
 @router.post("/lock/force-release")
-def force_release_lock(request: Request) -> dict[str, Any]:
+def force_release_lock(
+    request: Request, payload: MiningForceReleaseRequest | None = None,
+) -> dict[str, Any]:
     """终止陈旧锁持有者并由当前后端接管; 不满足陈旧判定时返回拒绝原因。"""
     from app.services.mining_lock_admin import (
         MiningLockAdminError,
-        force_release,
+        force_release_for_app,
     )
 
-    lock = getattr(request.app.state, "mining_process_lock", None)
-    if lock is None:
-        raise HTTPException(status_code=409, detail="挖掘锁状态不可用")
     try:
-        result = force_release(request.app.state.repo.store.data_dir, lock)
+        return force_release_for_app(
+            request.app.state, expected_pid=payload.expected_pid if payload else None,
+        )
     except MiningLockAdminError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    # 接管成功后同步降级标志, 挖掘入口立即恢复可用
-    request.app.state.mining_lock_acquired = True
-    return result
 
 
 @router.get("/availability")
@@ -305,6 +320,7 @@ def get_run(run_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/runs/{run_id}/cancel")
 def cancel_run(run_id: str, request: Request) -> dict[str, Any]:
+    _require_mining_lock(request)
     manager = _manager(request)
     try:
         return _project_run(manager.store, manager.cancel(run_id))

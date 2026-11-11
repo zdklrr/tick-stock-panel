@@ -348,12 +348,31 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
     rules = load_auto_rules(data_dir, account_id, enabled_only=True)
     if not rules:
         return created
+    # 0.3.48: 「今日上限 = 买入硬闸门」。每批事件只算一次 (内部 60s 缓存,
+    # 零额外网络), 且只有真正要买入时惰性触发; 卖出路径完全不碰这个数 (铁律)。
+    cap_pct: float | None = None
+    # 本批事件价当实时快照传给闸门估值 (只用于已有持仓的现价, 纯本地读 parquet)。
+    # 逐条 try: 脏事件 (price 是坏字符串) 绝不能把整批自动跟单带崩。
+    event_price_map: dict[str, float] = {}
+    for e in events:
+        sym = (e.get("symbol") or "").strip()
+        if not sym:
+            continue
+        try:
+            p = float(e.get("price"))
+            if p > 0:
+                event_price_map[sym] = p
+        except (TypeError, ValueError):
+            continue
     with paper.PAPER_LOCK:
         # 同一批事件内复用快照, 由 create_order 后的持仓变化反映 (循环内重取)
         for ev in events:
             symbol = (ev.get("symbol") or "").strip()
-            price = ev.get("price")
-            if not symbol or price is None or price <= 0:
+            try:
+                price = float(ev.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if not symbol or price <= 0:
                 continue
             for rule in rules:
                 if not _matches(rule, ev):
@@ -398,6 +417,29 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
                 if qty <= 0:
                     logger.info("paper auto %s: %s 金额不足以一手 (价 %s)", rule["name"], symbol, price)
                     continue
+                if side == "buy":
+                    # 买前看「买完后 市值/总资产」是否会超今日上限; 超了这一笔
+                    # 直接跳过 (不缩量、不改规则、留日志), 已有持仓一股不卖。
+                    try:
+                        from app.strategy import paper_plans as _pp
+
+                        if not _pp.SUGGESTED_CAP_ENABLED:
+                            pass
+                        else:
+                            if cap_pct is None:
+                                cap_pct = _pp.suggested_exposure_pct(data_dir, account_id)
+                            if _pp._would_exceed_exposure_cap(
+                                data_dir, account_id, float(price), qty, cap_pct,
+                                event_price_map,
+                            ):
+                                logger.info(
+                                    "paper auto %s: %s 跳过买入 — 今日上限 %.1f%%: "
+                                    "买入后仓位将超限 (择时×情绪×外围); 已有持仓不受影响",
+                                    rule["name"], symbol, cap_pct,
+                                )
+                                continue
+                    except Exception as e:  # noqa: BLE001 — 闸门取数失败按不限制放行
+                        logger.warning("paper auto 今日上限闸门取数失败 (放行): %s", e)
                 order, err = paper.create_order(
                     data_dir, symbol, side,
                     account_id=account_id,

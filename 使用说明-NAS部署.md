@@ -1,6 +1,123 @@
 # TSP 面板 — NAS 部署说明
 
-> 部署时间：2026-11-10 · 版本 **v0.3.47** · 已在本机浏览器实测通过
+> 部署时间：2026-11-11 · 版本 **v0.3.48**（端口 **1923** 独立实例；端口 923 的 0.3.47 生产实例保持原样不动）
+>
+> **v0.3.48 新增｜完整移植上游 0.3.34 + 独立 1923 部署**：
+>
+> 用户要求「重新复制到 `G:\TSP`，在这个文件夹里修改，部署到 NAS 用端口 1923，选第二项：完整 rebase 再叠加定制」，
+> 并明确「不影响改过的功能可以直接移植、会影响的列出来让我选择」。本版是**在全新工作区 `G:\TSP` 里**做的，
+> 旧目录 `G:\tick_stock_panel` 仍是干净的 0.3.47，两个 NAS 实例并行运行、互不干扰。
+>
+> | 项目 | 923 生产实例（保持原样） | 1923 新实例（本版） |
+> |---|---|---|
+> | 访问地址 | `http://<NAS_LAN_IP>:923` | `http://<NAS_LAN_IP>:1923` |
+> | 版本 | **0.3.47** | **0.3.48** |
+> | 源码目录 | `/volume1/docker/TSP/src/tick-stock-panel-main` | `/volume1/docker/TSP1923/src/tick-stock-panel-main` |
+> | compose 目录 | `/volume1/docker/TSP` | `/volume1/docker/TSP1923` |
+> | 容器名 | `TickFlow_Stock_Panel` | `TSP1923_Panel` |
+> | 镜像 | `tsp-nas:0.3.47` | `tsp1923:0.3.48` |
+> | 宿主端口 → 容器内 | `923 → 3018` | `1923 → 3018` |
+> | data 目录 | `/volume1/docker/TSP/data` | `/volume1/docker/TSP1923/data` |
+> | compose 项目名 | `tsp`（由目录推导） | `-p tsp1923`（显式指定） |
+> | Web 密码 | <WEB_PASSWORD> | <WEB_PASSWORD> |
+>
+> 1. **完整 rebase**：上游 `shy3130/tick-stock-panel` 自 fork 基线（0.3.26）之后的 **53 个提交 / 397 文件变化**
+>    全部合入（部署稳定性修复、K 线分钟补缺、图表引擎统一到 lightweight-charts 5.2.1、
+>    策略池分组/归档/备份恢复、自选股图表、回测净值回撤图等），**同时保留我们 0.3.27~0.3.47 的全部定制**
+>    （zdk 22 策略、腾讯/新浪免费源、风险雷达/盘前简报/大盘择时四卡、模拟盘自动仓位与择时缩放、
+>    今日盈亏、名称三层兜底、策略池删除、策略→交易计划、手机响应式等）。
+> 2. **上游「针对老版本已有功能的优化升级」已全部吸收、0 遗漏**（`_verify\verify_all_upstream_changes.py`
+>    全树扫描：upstream 变化 393 文件 → UPSTREAM_OK=363 / MERGED=30 / 丢失=0；28 个双方都改的文件
+>    `merged=28 / upstream_lost=0 / ours_lost=0`，21 个上游修复标记全在）。代表性优化：Windows 白屏、
+>    覆盖升级配置丢失、Docker 路径错位丢配置、无控制台连接探测、K 线 `quote_ts` 列兼容(#537)、
+>    历史分钟 K 早盘补缺、自选添加自动加载日K/分时、分时昨收零轴对称、策略卡片参数误判、分钟 bar 归一等。
+>    结论：无需再补改（改了反而有回归风险），我们的定制功能一个都没动。
+> 2b. **11 个双方都改的文件逐个手工三方合并**（以上游为底重放我们的定制），不是整块保留旧版；
+>    `StrategyPoolDialog` 以上游 495 行重写为底、**补回我们 0.3.28 的「删除策略文件」功能**（上游重写丢掉了它）。
+>    详见 `G:\TSP\使用说明-TSP客户端.md` 的 v0.3.48 节。
+> 3. **两条移植路径都做了真实编译裁决**：按主题挑 242 文件会切断上游内部一致性（不可编译，已完整还原）；
+>    最终用 git 全量三方合并树 + 逐个修。本地 `tsc` 0 错、`vitest 849 passed`、`pytest 234 passed`、`vite build` 成功、
+>    全树 0 冲突标记、10/10 定制功能标记存活。
+> 4. **部署脚本**（全在 `G:\TSP\_deploy\`，必须用 dsh python 跑 paramiko）：
+>    `upload_1923.py`（tar 白名单流式上传 + md5 校验 + 18 项抽查）、
+>    `rebuild_1923.py`（只 `docker compose -p tsp1923`、清镜像只匹配 `^tsp1923:`、禁 image prune、绝不碰 923）、
+>    `verify_1923.py`（30+ 项隔离验收）、`nas_1923_baseline.py`（部署前 923 基线）。
+> 5. **首轮构建失败已修**：`upload_1923.py` 的裸名 `data` 排除规则误剪真实源码 `frontend/src/data` 与
+>    `frontend/src/components/data`(27 模块)，导致 `pnpm build` 报 `TS2307`。改为只锚定根级 `data`/`backend/data`，
+>    `.dockerignore` 同步改 `/data` + `/backend/data`；重传 source files 1343→**1371**，二次 `BUILD_RC=0`。
+> 6. **验收 `verify_1923.py` → FAILS=0**：1923 `/health`=0.3.48、`/api/data/version`=v0.3.48、
+>    `/api/risk/radar` 可用；1923 容器/镜像/端口/挂载全部隔离，923 与 1923 data 目录 inode 不同、marker 不泄漏；
+>    **923 容器 ID `a6c4319601b3bf2ac7cdede8ec95711461af60e833fc0f0f04b175076b4f3eba`、镜像 `tsp-nas:0.3.47`、
+>    StartedAt `2026-11-10T06:35:55.888865647Z` 三项全部未变**（从未重启，923 `/health` 仍 0.3.47）。
+> 7. **`mode=none` 已解决（1923 共用 923 的数据源与日K）**：见下方「**v0.3.48 补充｜923 → 1923 数据同步**」一节。
+>    1923 原本是全新空 data 目录、没配数据源，`/health` 的 `mode=none`，打开个股详情会报「日K数据源获取失败」。
+>    现已一次性共享 923 的 `capabilities.json` / `secrets.json` / `preferences.json` 让 1923 变 `mode=free`，
+>    并把 923 已下载的日K/分钟K/维表/复权/fuyao 缓存单向同步过来，且每天 16:30 自动同步。
+>    `paper/compare` 仍是 1923 自己的空账户（模拟盘/密码哈希刻意保持独立，不共享）。
+>
+> **v0.3.48 补充｜923 → 1923 数据同步（用户：能不能两边共用一个数据源和下载好的日K）**
+>
+> 用户选「**独立 + 每天自动同步**」：两个实例各保留独立 `data/` 目录（不整目录共享，避免两容器同时写同一批
+> parquet / `.lock` 损坏数据、模拟盘账户混杂），由 923 单向把「行情数据」同步给 1923，923 全程只读、绝不重启。
+>
+> | 项 | 内容 |
+> |---|---|
+> | 一次性配置共享 | 宿主侧 `sudo cp` 把 923 的 `data/capabilities.json`、`data/user_data/secrets.json`、`data/user_data/preferences.json` 复制到 1923（密钥不离 NAS），`secrets.json` chmod 600；复制后 1923 `/health` 从 `mode=none` 变 **`mode=free`** |
+> | 每日单向同步 | `/etc/cron.d/tsp1923-data-sync` 每天 **16:30（北京时间，避开 923 15:35 盘后管道）** 以 root 跑 `/volume1/docker/TSP1923/sync_from_923.sh` |
+> | 同步范围（取并集） | 10 个 `kline_*`/`adj_factor*` 分区目录 + `cache/fuyao`（181MB 全市场日K dump）：`rsync -a --ignore-existing --include='*/' --include='*.parquet' --exclude='*'`，不覆盖 1923 自建分区、不加 `--delete` |
+> | 维表（923 权威覆盖） | `instruments`/`instruments_etf`/`instruments_index`/`instruments_ext` **不加 `--ignore-existing`** —— 否则 1923 会一直保留自己那份不完整维表（实测 68KB 缺深市名称，923 是 192KB 完整表），表现为「1923 股票只有代码没有名字」|
+> | 绝不同步 | `user_data/auth.json`（各自的 Web 密码哈希，0600）、`paper/`、`job_store/`、`regime_history/`、`mainline_history/`、`upgrade_guard/`、`strategies/`、`logs/`、任何 `.lock`/`.tmp`/`.bak` |
+> | 何时重启 1923 | 仅当「有新增 parquet 文件」或「维表内容变化」时 `docker restart TSP1923_Panel`（重建 Polars 内存缓存 / DuckDB 视图 / `get_name_map` 缓存）；稳态（无新文件）跳过重启。脚本内 `flock` 防重入、日志封顶 2MB |
+> | 关键脚本 | `G:\TSP\_deploy\sync_from_923.sh`（同步本体，也部署到 NAS）、`setup_data_sync.py`（`--apply` 一次性落地 + `--verify` 18 项验收）、`verify_1923.py`（实例隔离验收） |
+>
+> - **验收 `setup_data_sync.py --verify` → 18/18 PASS**：923 容器 ID / StartedAt / Image / Status 全部未变、
+>   `/health` 仍 0.3.47；1923 `auth.json` 未变（登录 <WEB_PASSWORD> 仍可用）、`mode=free`、`kline_daily` 249 分区、
+>   `/api/kline/daily?symbol=600000.SH&days=10` 返回「浦发银行 8 行」、cron 已注册、sync.log 有完整 run。
+> - **首次全量同步**：`new parquet files = 1017`（约 380MB 行情数据），923 → 1923 拉平；随后一次 v2 修正把维表
+>   改为 923 权威覆盖，重跑后 8 只抽样股票（含深市 `000001.SZ`/`300007.SZ`/`002088.SZ`/`300473.SZ`）**名称与
+>   行数全部与 923 一致**。
+> - **已知限制（与数据共享无关）**：指数 `000300.SH` 走股票日K端点、10 天窗口时，923 返回 10 行而 1923 返回 0 行；
+>   两容器 `kline_index_daily` parquet 逐字节相同、`days=30/120/指定区间` 均完全一致（各 15/73/17 行），
+>   这是 0.3.48 与 0.3.47 在「空结果触发 `daily_bootstrap.ensure_history`」路径上的运行时差异，
+>   `000001.SH`/`399001.SZ` 等其它指数均正常。指数行情本身已同步、不影响大盘择时/情绪周期/风险雷达。
+> - 备份/回滚：`/volume1/docker/TSP1923/data` 是 1923 唯一数据源；同步只增不删（`--ignore-existing`），
+>   随时可删掉 `/etc/cron.d/tsp1923-data-sync` 停止自动同步，923 侧从未被写入任何文件。
+>
+> **v0.3.48 补充｜923 策略库复制到 1923（用户：把 923 端口的策略也复制过去）**
+>
+> - 923 的 `data/strategies/custom/` 有 **27 个 .py**（24 个 zdk 策略 + 3 个 `_zdk_*` helper）+ 2 个 README + `.seeded_v1`；
+>   1923 原本只有 `.seeded_v1`、`/api/strategies` 返回 `{"strategies":[]}`。
+> - 用 `G:\TSP\_deploy\copy_strategies_to_1923.py`（宿主侧 tar 流式复制，`--exclude=__pycache__`，**923 全程只读**）
+>   把 27 个 .py 逐字节复制到 1923，再用 `finalize_strategies_1923.py` 从 Windows 端 HTTP 登录调
+>   `POST /api/strategies/reload` 热加载 → **`{"ok":true,"count":24}`、`load_errors: []`**，
+>   24 个 id 全部可用（`zdk_breakout` … `zdk_yaoxin`），1923 `/health` 仍 0.3.48、923 仍 0.3.47。
+> - **没有复制「策略池勾选状态」**：0.3.47（923）的策略池选择存在浏览器 localStorage（`storage.ts` 的
+>   `strategy-pool`），服务端没有副本；0.3.48（1923）改成服务端 `data/user_data/strategy_pool.json` v2。
+>   两者存储模型不同，需要群策略的话在 1923 界面里重新勾选即可（或按 24 个 id 生成 v2 池文件）。
+>   注：策略**定义文件**不在每天 cron 同步范围内（上面「绝不同步」清单里的 `strategies/`），
+>   本次是一次性复制；以后 923 新增策略要再跑一次复制脚本。
+>
+> **v0.3.48 补充｜模拟盘「当前仓位 / 计划仓位 / 今日上限」口径说明（用户：持仓比计划和上限还高）**
+>
+> 三个数字是**不同口径**、不是同一个数，出现「当前仓位 > 今日上限」属正常，不是 bug：
+>
+> | 数字 | 怎么来的 | 会不会变 |
+> |---|---|---|
+> | **当前仓位** | `实时持仓市值 ÷ 总资产`（`PlanPanel.tsx` `positionPct = market_value/total`） | 随行情实时变，**股价涨了就变大**（含浮盈） |
+> | **计划仓位** | 建计划那一刻冻结的各计划 `pos_pct` 之和（`planPosPct = Σ pos_pct`） | 冻结值，**不随行情重算** |
+> | **今日上限** | 此刻 `/api/risk/advice` 的 `suggested_exposure_pct` = `大盘择时 × 情绪周期 × 外围风险`（`market_timing.synthesize()`，夹 `[0.15,1.20]`），再受 `plan_config.max_total_exposure_pct` 约束 | **盘中随时跳**，情绪周期阶段/外围分数一变就变 |
+>
+> - **铁律：卖出永不受择时/风险系数影响**。「今日上限」是对**今天新买入**的前瞻软建议，
+>   系统绝不会因为盘面转弱自动卖掉已有持仓 → 老仓可以「超标」。
+> - 实例（923 `arena_fc343cf626`，2026-11-11）：14:06 截图时 `当前仓位 58.2% / 今日上限 36.0% / 计划仓位 56.8%`；
+>   36% = `择时 0.35(risk_off 空头趋势) × 情绪 1.0(lean_strong) × 外围 1.03 ≈ 36%`。
+>   14:24 复查时情绪周期升级为 `strong(×1.2)`、外围 1.043 → 上限跳到 **43.8%**。
+>   计划 `timing_scale=1.0 / state=lean_strong` 说明这 3 只是**上午盘面偏强时建的仓**，下午大盘转 `risk_off` 后上限才降到 36%，
+>   属正常时序差。当前仓位 58% 高的另一原因是三只票涨价（含浮盈），市值口径比建仓时大。
+> - 真正想封顶：改 `plan_config.max_total_exposure_pct`（默认 100 = 不生效）。但**它只挡新买单，不会卖老仓**；
+>   要让已持仓降到上限以下，只能等计划触发的止损/目标价减半/清仓（卖出路径本身永不打折）。
+> - 自动跟单买入的每票金额：`G:\TSP\backend\app\strategy\paper_auto.py` 的 `equal_total` 分支
+>   `总仓% = 100×择时×情绪×外围回撤`、`每票% = 总仓% ÷ 缩放后的计划只数上限`，**刻意不用 synthesize()**（避免情绪重复计入）。
 >
 > **v0.3.47 新增**（修「收起状态看不到今日盈亏 / 交易计划只有代码没名字 / 看不懂撮合异常」）：
 > 1. **账户对比表的「最新日」列改名为「今日盈亏」并接到正确字段** —— 原来该列取的是 `day_change_pct`

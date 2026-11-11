@@ -26,9 +26,14 @@ def _neutral_radar(monkeypatch):
 
     本文件关心的是计划流转本身, 不能让测试真的去联网取外围行情 (慢且不稳定);
     雷达与动态系数的行为在 test_paper_auto_exposure.py 里专门验证。
+    v0.3.48: 顺带把「今日上限」钉成 100% (= 不限制), 使本文件原有买入断言
+    不受新硬闸门影响; 闸门本身在 test_paper_cap_gate.py 里专门验证。
     """
     monkeypatch.setattr(
         paper_plans, "_radar_coeffs", lambda *a, **kw: {**paper_plans._NEUTRAL_RADAR}
+    )
+    monkeypatch.setattr(
+        paper_plans, "suggested_exposure_pct", lambda *a, **kw: 100.0
     )
     paper_plans.invalidate_radar_cache()
 

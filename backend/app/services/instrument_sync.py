@@ -10,12 +10,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import date
 from pathlib import Path
 
 import polars as pl
 
+from app.market_time import cn_today
 from app.services.fs_utils import atomic_write_parquet
+from app.tickflow import client as tf_client
 from app.tickflow.client import get_client
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 _EXCHANGES = ["SH", "SZ", "BJ"]
 
 
-def _flatten_instruments(items: list[dict]) -> list[dict]:
+def _flatten_instruments(items: list[dict], *, current_limits: bool = True) -> list[dict]:
     """把 SDK 返回的 Instrument 列表 flatten 成扁平行。"""
     rows = []
     for item in items:
@@ -40,8 +41,8 @@ def _flatten_instruments(items: list[dict]) -> list[dict]:
         row["total_shares"] = ext.get("total_shares")
         row["float_shares"] = ext.get("float_shares")
         row["tick_size"] = ext.get("tick_size")
-        row["limit_up"] = ext.get("limit_up")
-        row["limit_down"] = ext.get("limit_down")
+        row["limit_up"] = ext.get("limit_up") if current_limits else None
+        row["limit_down"] = ext.get("limit_down") if current_limits else None
         rows.append(row)
     return rows
 
@@ -83,12 +84,14 @@ def sync_instruments(data_dir: Path) -> int:
     if all_rows is None:
         # 未命中非 tickflow provider → 走 tickflow 直连
         tf = get_client()
+        # 免费接口的限价来自历史行情，不能盖上同步日期当作当日权威价。
+        current_limits = tf_client.current_mode() == "api_key"
         all_rows = []
         for ex in _EXCHANGES:
             try:
                 items = tf.exchanges.get_instruments(ex, instrument_type="stock")
                 if items:
-                    all_rows.extend(_flatten_instruments(items))
+                    all_rows.extend(_flatten_instruments(items, current_limits=current_limits))
                     logger.info("instruments %s: %d stocks", ex, len(items))
             except Exception as e:
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
@@ -113,7 +116,7 @@ def sync_instruments(data_dir: Path) -> int:
     df = _preserve_share_fields(df, data_dir)
     # 新源整行缺失的标的 (按 symbol) 从旧维表补回, 不让它们凭空消失
     df = _restore_missing_symbols(df, existing)
-    df = df.with_columns(pl.lit(date.today()).alias("as_of"))
+    df = df.with_columns(pl.lit(cn_today()).alias("as_of"))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_parquet(df, out)
@@ -155,14 +158,14 @@ def _restore_missing_symbols(df: pl.DataFrame, existing: pl.DataFrame | None) ->
     return merged
 
 
-# 股本与交易规则字段: 部分行情源的标的维表只有代码/名称/市场/类型。
-# 这些字段缺失会让 enriched 的 turnover_rate / 市值 / 涨跌停判定全空, 进而使
+# 股本与静态交易规则字段: 部分行情源的标的维表只有代码/名称/市场/类型。
+# 这些字段缺失会让 enriched 的 turnover_rate / 市值为空, 进而使
 # 依赖换手率与流通市值的策略筛不出任何标的 —— 因此绝不能用 null 覆盖已有值。
 # name 一并纳入: 免费源偶尔把 name 填成占位符 (等于 code/symbol) 或留空,
 # 这里按「缺失」处理并用历史值兜回, 否则持仓/自选/监控全部显示不出中文名。
+# 涨跌停价随交易日变化，不从历史维表继承。
 _SHARE_FIELDS = (
     "name", "listing_date", "total_shares", "float_shares", "tick_size",
-    "limit_up", "limit_down",
 )
 
 #: 视为「name 缺失」的占位值 —— 免费源常用代码自填充, 不能当成有效名称。

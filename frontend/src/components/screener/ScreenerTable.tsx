@@ -448,7 +448,7 @@ export function ScreenerTable({
       }
       default:
         // 纯数据列 → 共享原语
-        return renderBuiltinDataCell(r, col)
+        return renderBuiltinDataCell(r, col, assetType)
     }
   }
 

@@ -19,7 +19,13 @@ from typing import Literal
 import numpy as np
 import polars as pl
 
-from app.backtest.engine import BacktestEngine, MatcherConfig, SimResult, SimulationOptions
+from app.backtest.engine import (
+    BacktestEngine,
+    MatcherConfig,
+    SimResult,
+    SimulationOptions,
+    history_load_start,
+)
 from app.backtest.fundamentals import FUNDAMENTAL_FACTOR_NAMES
 from app.backtest.matrix import (
     MarketDataMatrix,
@@ -75,6 +81,25 @@ _EXECUTION_COLUMNS = frozenset({
 })
 _LIMIT_BASE_COLUMNS = frozenset({"raw_close", "raw_high", "raw_low"})
 _INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares"})
+
+
+def validate_minute_backtest_coverage(
+    strategy: StrategyDef, repo, start: date, asset_type: str,
+) -> None:
+    """页面与 AI 工具共用分钟回测前置检查，不改变逐日回放的缺分区语义。"""
+    if strategy.execution_backend != "minute_filter":
+        return
+    if asset_type != "stock":
+        raise ValueError("分钟策略回测当前仅支持 A 股 (stock)")
+    if repo is None:
+        raise ValueError("行情仓库未注入，无法检查分钟K覆盖范围")
+    earliest = repo.earliest_minute_date()
+    if earliest is None or start < earliest:
+        have = f"最早到 {earliest}, " if earliest else ""
+        raise ValueError(
+            f"本地分钟K{have}无法覆盖回测起始日 {start}。"
+            "请先用「扩展分钟K历史」拉取更多数据, 或缩小回测区间"
+        )
 
 
 @dataclass(frozen=True)
@@ -329,7 +354,8 @@ class StrategyDependencyResolver:
             scoring_warmup_bars(scoring),
             scoring_warmup_bars(parameter_scoring),
         )
-        matrix_columns = set(base_columns) | set(instrument_columns) | overlay_fields | {
+        ext_columns = {field for field in required_features if field.startswith("ext_")}
+        matrix_columns = set(base_columns) | set(instrument_columns) | overlay_fields | ext_columns | {
             "signal_limit_up",
             "signal_limit_down",
         }
@@ -452,8 +478,7 @@ def prewarm_matrix_cache(
         max_disk_bytes=settings.backtest_matrix_cache_max_mb * 1024 * 1024,
     )
     formal_start = date(max(1, latest_date.year - years + 1), 1, 1)
-    warmup_days = max(120, int(max(profile.warmup_bars, 1) * 1.6))
-    coverage_start = formal_start - timedelta(days=warmup_days)
+    coverage_start = history_load_start(engine, formal_start, asset_type, profile.warmup_bars)
     prewarm_columns = frozenset({
         "symbol",
         "date",
@@ -1052,10 +1077,8 @@ class StrategyBacktestService:
             requested_forward_bars=full_horizon_days,
             max_disk_bytes=settings.backtest_matrix_cache_max_mb * 1024 * 1024,
         )
-        warmup_days = max(120, int(max(feature_plan.warmup_bars, 1) * 1.6))
-        load_start = first.start - timedelta(days=warmup_days)
-        cache_warmup_days = max(120, int(max(cache_profile.warmup_bars, 1) * 1.6))
-        coverage_start = first.start - timedelta(days=cache_warmup_days)
+        load_start = history_load_start(self.engine, first.start, first.asset_type, feature_plan.warmup_bars)
+        coverage_start = history_load_start(self.engine, first.start, first.asset_type, cache_profile.warmup_bars)
         load_end = first.end
         coverage_end = first.end
         if first.mode == "full":
@@ -1219,8 +1242,7 @@ class StrategyBacktestService:
 
         max_hold_days = self._override_value(overrides, "max_hold_days", strategy.max_hold_days)
         full_horizon_days = max(int(max_hold_days or first.holding_days or 5), 1)
-        warmup_days = max(120, int(max(feature_plan.warmup_bars, 1) * 1.6))
-        load_start = first.start - timedelta(days=warmup_days)
+        load_start = history_load_start(self.engine, first.start, first.asset_type, feature_plan.warmup_bars)
         load_end = first.end
         if first.mode == "full":
             load_end = first.end + timedelta(days=(full_horizon_days + 5) * 2)
@@ -1443,8 +1465,10 @@ class StrategyBacktestService:
         matrix_data_cache_timing_ms: Mapping[str, float] = {}
 
         # 加载 warmup + 正式区间。矩阵策略的 warmup 由协议解析，不再依赖策略名称。
-        warmup_days = max(120, int(max(feature_plan.warmup_bars, 1) * 1.6))
-        load_start = config.start - timedelta(days=warmup_days)
+        shared = prepared or prepared_panel
+        load_start = shared.load_start if shared is not None else history_load_start(
+            self.engine, config.start, config.asset_type, feature_plan.warmup_bars,
+        )
 
         # 全量模式: entries 只在正式区间触发, exits 需要 end 之后的尾部数据继续执行策略卖点。
         # 若策略有 max_hold_days, 用它决定尾部窗口；否则 holding_days 只作为兜底观察上限。
@@ -1493,11 +1517,7 @@ class StrategyBacktestService:
                 requested_forward_bars=profile_forward,
                 max_disk_bytes=settings.backtest_matrix_cache_max_mb * 1024 * 1024,
             )
-            cache_warmup_days = max(
-                120,
-                int(max(cache_profile.warmup_bars, 1) * 1.6),
-            )
-            coverage_start = config.start - timedelta(days=cache_warmup_days)
+            coverage_start = history_load_start(self.engine, config.start, config.asset_type, cache_profile.warmup_bars)
             coverage_end = config.end
             if config.mode == "full":
                 coverage_end = config.end + timedelta(

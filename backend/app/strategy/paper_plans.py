@@ -326,17 +326,26 @@ def buy_ctx(
     state_now=_MISSING,
     radar=_MISSING,
 ) -> dict:
-    """下单时刻的上下文 {cfg, state, radar} (evaluate_plans 每轮算一次复用)。
+    """下单时刻的上下文 {cfg, state, radar, cap_pct} (evaluate_plans 每轮算一次复用)。
 
     radar 传 dict 就直接用 (含中性系数), 传 _MISSING 才去取雷达 —— 没有待买入
     计划时调用方会传中性系数, 避免为了「看一眼持仓」白等一次联网取外围行情。
     在网络取数与读盘方面刻意不持锁: 雷达首次取数要几百毫秒, 不能卡在 PAPER_LOCK 里。
+
+    0.3.48: cap_pct 是决策卡「今日上限」的买入硬闸门, 复用本轮已取好的
+    state/radar, 只补一次只读本地的 trend_exposure, 零额外联网 (绝不调
+    synthesize())。_try_buy 在 create_order 前用它判断「买完是否超限」。
     """
     rad = radar if isinstance(radar, dict) else _radar_coeffs(data_dir, account_id)
+    state = trade_plan.latest_state(data_dir) if state_now is _MISSING else state_now
     return {
         "cfg": trade_plan.merge_cfg(cfg) if cfg is not None else load_cfg(data_dir, account_id),
-        "state": trade_plan.latest_state(data_dir) if state_now is _MISSING else state_now,
+        "state": state,
         "radar": rad,
+        "cap_pct": (
+            suggested_exposure_pct(data_dir, account_id, state=state, radar=rad)
+            if SUGGESTED_CAP_ENABLED else 100.0
+        ),
     }
 
 
@@ -380,6 +389,111 @@ def _affordable_qty(data_dir: Path, account_id: str, px: float, want: int) -> in
             break
         lots -= 1
     return max(min(paper.normalize_qty(want), lots * paper.LOT_SIZE), 0)
+
+
+#: 「今日上限 = 买入硬闸门」总开关 (0.3.48)。置 False 可回到旧行为
+#: (只数/金额缩放 + cfg.max_total_exposure_pct), 改完需重新打包。
+SUGGESTED_CAP_ENABLED = True
+#: 合成仓位上下限, 与 market_timing.SYN_FLOOR / SYN_CAP 保持一致
+_CAP_FLOOR = 0.15
+_CAP_CAP = 1.20
+#: trend_timing(_heal=False) 只读本地 parquet, 但 21 个账户 × 每轮行情快照全扫
+#: 一遍分区在 NAS (J1900) 上仍嫌浪费: 按 data_dir 缓存 60 秒 (与雷达同量级)。
+_TIMING_CACHE: dict[str, tuple[float, float]] = {}
+_TIMING_CACHE_TTL = 60.0
+_TIMING_LOCK = threading.Lock()
+
+
+def _cap_timing(data_dir: Path) -> float:
+    """只读本地的大盘择时系数 (60s 缓存, 数据判不出四态 → 1.0 中性)。"""
+    key = str(data_dir)
+    now = time.monotonic()
+    with _TIMING_LOCK:
+        hit = _TIMING_CACHE.get(key)
+    if hit is not None and now - hit[0] < _TIMING_CACHE_TTL:
+        return hit[1]
+    from app.services import market_timing as _mt
+
+    snap = _mt.trend_timing(Path(data_dir), _heal=False) or {}
+    t = float(snap.get("exposure") or 1.0) if snap.get("ok") else 1.0
+    with _TIMING_LOCK:
+        _TIMING_CACHE[key] = (now, t)
+    return t
+
+
+def suggested_exposure_pct(
+    data_dir: Path,
+    account_id: str,
+    *,
+    timing: float | None = None,
+    phase: float | None = None,
+    risk: float | None = None,
+    state=None,
+    radar: dict | None = None,
+) -> float:
+    """今日上限 (%) = clamp(大盘择时 × 情绪周期 × 外围风险, 0.15, 1.20) × 100.
+
+    与决策卡 `/api/risk/advice` 的 `suggested_exposure_pct` **数值同源**, 但
+    **刻意不调 `synthesize()`** —— 那会额外跑一次带网络自愈的 `trend_timing()`
+    和联网的 `radar_snapshot()`, 在买入热路径 (每轮行情快照 × 每个账户) 会造成
+    NAS 上的同步等待 (0.3.44 曾因此让 /api/risk/advice 120s 超时)。三路系数全部
+    允许调用方传入、复用已缓存的结果, 做到零额外网络:
+      - timing: 传入则复用; 否则 `_cap_timing()` = `trend_timing(_heal=False)`
+                只读本地 parquet (60s 缓存), 判不出四态按 1.0 中性 —— 与
+                `synthesize()` 的 timing 部分严格同源, 但绝不触发网络自愈;
+      - phase : 传入则复用; 否则 `trade_plan.exposure_multiplier(state)`
+                (不传 cfg, 与 `market_timing._phase_part` 严格一致);
+      - risk  : 传入则复用; 否则 `radar['global_exposure']` 或 `_radar_coeffs()`
+                (== `radar_snapshot().global_exposure`, 不含账户回撤)。
+    任何一路取数失败按「不限制」(100.0) 降级, 绝不抛异常阻断买入。
+    """
+    try:
+        t = float(timing) if timing is not None else _cap_timing(Path(data_dir))
+        p = (float(phase) if phase is not None
+             else float(trade_plan.exposure_multiplier(
+                 state if state is not None else trade_plan.latest_state(Path(data_dir)))))
+        if risk is not None:
+            r = float(risk)
+        else:
+            rad = radar if radar is not None else _radar_coeffs(Path(data_dir), account_id)
+            r = float(rad.get("global_exposure") or 1.0)
+    except Exception as e:  # noqa: BLE001 — 系数不可用按不限制处理
+        logger.warning("suggested_exposure_pct 取数失败 (按不限制): %s", e)
+        return 100.0
+    raw = t * p * r
+    return round(min(max(raw, _CAP_FLOOR), _CAP_CAP) * 100.0, 1)
+
+
+def _would_exceed_exposure_cap(
+    data_dir: Path,
+    account_id: str,
+    px: float,
+    qty: int,
+    cap_pct: float,
+    price_map: dict[str, float] | None = None,
+) -> bool:
+    """买完这一笔后「持仓市值 / 总资产」是否会超过 cap_pct%.
+
+    买入是现金 → 持仓, 总资产不变 (忽略手续费), 所以分子加 `qty*px`、分母不变。
+    估值与决策卡「当前仓位」同源: 传 price_map (本轮实时快照) 就按实时价估,
+    没有则退回最近日线收盘价 (`valuation="daily"`); 两者都纯本地读 parquet,
+    30s 缓存, 绝不联网。取数失败一律放行 (宁可多买一手, 也不因展示层问题卡单)。
+    """
+    if cap_pct >= 100 or qty <= 0 or px <= 0:
+        return False
+    try:
+        if price_map:
+            ov = paper.overview(data_dir, price_map, account_id=account_id) or {}
+        else:
+            ov = paper.overview(data_dir, account_id=account_id, valuation="daily") or {}
+        equity = float(ov.get("total") or 0.0)
+        mv = float(ov.get("market_value") or 0.0)
+        if equity <= 0:
+            return False
+        return (mv + qty * px) / equity > cap_pct / 100.0
+    except Exception as e:  # noqa: BLE001
+        logger.warning("exposure cap 估值失败 (放行): %s", e)
+        return False
 
 
 def _exposure_capped_qty(
@@ -964,6 +1078,8 @@ def evaluate_plans(
             cfg=cfg,
             radar=_MISSING if has_pending else _NEUTRAL_RADAR,
         )
+        # 硬闸门按「当前仓位」口径用本轮实时快照估值 (只在有 pending 计划时透传)
+        ctx["price_map"] = snapshot if has_pending else None
         changed: list[dict] = []
         for plan in plans:
             if plan["status"] in ("closed", "expired", "cancelled"):
@@ -1057,6 +1173,20 @@ def _try_buy(
         if plan["symbol"] not in held and len(held) >= max_symbols:
             plan["last_error"] = f"持仓标的数已达上限 {max_symbols} (cfg.max_symbols), 本次不买入"
             return
+
+    # 0.3.48: 「今日上限 = 硬闸门」。买之前先看「买完后 市值/总资产」会不会
+    # 超过 ctx.cap_pct (与决策卡同源: 择时×情绪×外围, 夹 15%~120%)。超了这一笔
+    # 直接不买 (不缩量、不改计划状态、留 pending 等盘面转好或仓位降下来再触发)。
+    # 卖出路径完全不看这个数 (铁律), 已有持仓一股不动。
+    cap_pct = float(ctx.get("cap_pct") or 100.0) if isinstance(ctx, dict) else 100.0
+    price_map = ctx.get("price_map") if isinstance(ctx, dict) else None
+    if _would_exceed_exposure_cap(data_dir, account_id, px, qty, cap_pct, price_map):
+        plan["last_error"] = (
+            f"今日上限 {cap_pct:.1f}% (择时×情绪×外围): 买入后仓位将超限, 本次不买入; "
+            f"已有持仓不受影响, 降仓由计划触发"
+        )
+        logger.info("paper plan %s: %s", plan.get("symbol"), plan["last_error"])
+        return
 
     # next_open 交给盘后结算按次日开盘价成交, 其余两种走盘中市价撮合
     order_type = "next_open" if mode == "next_open" else "market"

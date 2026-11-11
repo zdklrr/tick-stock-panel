@@ -38,6 +38,11 @@ def _neutral_radar(monkeypatch):
         monkeypatch.setattr(
             global_risk, "exposure_for_paper", lambda *a, **kw: (1.0, 1.0), raising=False
         )
+    # v0.3.48: 本文件专测「动态系数/人为闸门」, 把「今日上限」钉成 100%
+    # (= 不限制), 避免新硬闸门改变这里的股数断言; 闸门另见 test_paper_cap_gate.py。
+    monkeypatch.setattr(
+        paper_plans, "suggested_exposure_pct", lambda *a, **kw: 100.0
+    )
     paper_plans.invalidate_radar_cache()
 
 

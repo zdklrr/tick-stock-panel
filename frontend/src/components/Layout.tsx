@@ -9,6 +9,7 @@ import { AiAnalysisHost } from '@/components/financials/AiAnalysisHost'
 import { AiReportBubble } from '@/components/financials/AiReportBubble'
 import { DailyDataHealthNotice } from '@/components/data/DailyDataHealthNotice'
 import { StockAnalysisHost } from '@/components/stock-analysis/StockAnalysisHost'
+import { StockPreviewHost } from '@/components/StockPreviewHost'
 import { StockAnalysisBubble } from '@/components/stock-analysis/StockAnalysisBubble'
 import {
   useCapabilityMatrix,
@@ -23,6 +24,7 @@ import {
 } from '@/lib/useSharedMutations'
 import { QK, MINUTE_DATA_QUERY_PREFIXES } from '@/lib/queryKeys'
 import { setUiPref } from '@/lib/uiPrefs'
+import { useStrategyLibrarySync } from '@/lib/strategyLibrary'
 import { getPageScale } from '@/lib/pageZoom'
 import { setKlineBatchLimits } from '@/lib/klineBatchLimits'
 import { compareByDefaultNav, defaultNavIndex, seedHiddenForNewUser } from '@/lib/navOrder'
@@ -369,6 +371,7 @@ function AIConfigBadge({ configured, model }: { configured?: boolean; model?: st
 type NavState = 'expanded' | 'rail' | 'hidden'
 
 export function Layout() {
+  useStrategyLibrarySync()
   // ===== 共享 hooks (替代内联 useQuery) =====
   const { data: settingsState } = useSettings()
   const { data: matrix } = useCapabilityMatrix()
@@ -501,7 +504,9 @@ export function Layout() {
     if (refreshedMinuteJob.current === latestDataJob.id) return
     refreshedMinuteJob.current = latestDataJob.id
     // 复用常驻的任务轮询, 离开数据页后补拉结束也会刷新; 取消/失败可能已写入部分数据。
-    qc.invalidateQueries({ predicate: q => MINUTE_DATA_QUERY_PREFIXES.has(String(q.queryKey[0])) })
+    // 清掉列表增量游标，让下一次查询也能读回上次末根之前补入的早盘。
+    qc.resetQueries({ queryKey: QK.minuteBatch(), exact: true })
+    qc.invalidateQueries({ predicate: q => q.queryKey[0] !== QK.minuteBatch()[0] && MINUTE_DATA_QUERY_PREFIXES.has(String(q.queryKey[0])) })
     qc.invalidateQueries({ queryKey: QK.dataStatus })
   }, [latestDataJob?.id, latestDataJob?.status, qc])
   const navigate = useNavigate()
@@ -1176,6 +1181,7 @@ export function Layout() {
       <AiReportBubble />
       <StockAnalysisHost />
       <StockAnalysisBubble />
+      <StockPreviewHost />
 
       {/* 开启实时行情 + 排队中的挖掘任务 → 冲突确认 */}
       {miningQueuedWarning != null && (

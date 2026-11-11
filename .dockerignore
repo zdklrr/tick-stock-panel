@@ -9,8 +9,12 @@
 .gitignore
 
 # ===== 用户运行时数据(绝不应进镜像) =====
-data
-backend/data
+# 注意: 必须锚定根路径, 不能写成裸名 `data` —— frontend/src/data 与
+# frontend/src/components/data 是真实源码目录 (ossLicenses.ts / 27 个模块),
+# 裸 `data` 会把它们从 `COPY frontend/ ./` 的上下文里剔除, 导致 pnpm build
+# 报 TS2307 Cannot find module '@/components/data/...' / '@/data/ossLicenses'。
+/data
+/backend/data
 
 # ===== 前端构建产物 / 依赖(镜像内会重新 build, 带进来反而污染) =====
 frontend/node_modules
