@@ -1,6 +1,61 @@
 # TSP 面板 — NAS 部署说明
 
-> 部署时间：2026-11-11 · 版本 **v0.3.48**（端口 **1923** 独立实例；端口 923 的 0.3.47 生产实例保持原样不动）
+> 部署时间：2026-11-11 · 版本 **v0.3.48**（**三处统一**：本机 exe / NAS 923 / NAS 1923 全部 0.3.48；923 与 1923 两个独立实例并行运行）
+>
+> **v0.3.48 统一升级（2026-11-11 20:00）｜923 从 0.3.47 升到 0.3.48，三处版本号一致**
+>
+> 用户要求（逐字）：「那现在是不是可以把 923 部署的和 1923 一样了，包括本地的 exe 也弄成一样」、
+> 「如果能统一，那么版本号应该也一样」、「两个都先留着，只升级不删」、「「建议上限 = 硬闸门、超了就一分不买」这套逻辑」。
+>
+> | 项目 | 923 生产实例 | 1923 并行实例 |
+> |---|---|---|
+> | 访问地址 | `http://<NAS_LAN_IP>:923` | `http://<NAS_LAN_IP>:1923` |
+> | 版本 | **0.3.48**（原 0.3.47） | **0.3.48** |
+> | 源码目录 | `/volume1/docker/TSP/src/tick-stock-panel-main` | `/volume1/docker/TSP1923/src/tick-stock-panel-main` |
+> | compose 目录 | `/volume1/docker/TSP` | `/volume1/docker/TSP1923` |
+> | 容器名 | `TickFlow_Stock_Panel` | `TSP1923_Panel` |
+> | 镜像 | `tsp-nas:0.3.48`（旧 `0.3.47` 已清） | `tsp1923:0.3.48`（本次未动） |
+> | 宿主端口 → 容器内 | `923 → 3018` | `1923 → 3018` |
+> | data 目录 | `/volume1/docker/TSP/data` | `/volume1/docker/TSP1923/data` |
+> | compose 项目名 | `tsp`（由目录推导） | `-p tsp1923`（显式指定） |
+> | Web 密码 | <WEB_PASSWORD> | <WEB_PASSWORD> |
+>
+> **升级步骤（可复现）**：
+> 1. `python G:\TSP\_deploy\upload_0348.py` —— 把 0.3.48 全树打成 tar.gz（1372 源文件），
+>    经 `sudo -S tee` 二进制写入 `/tmp/tsp0348_src.tar.gz` 并 md5 校验，再 `tar -xzf` 就地覆盖
+>    923 构建上下文。**只碰 `/volume1/docker/TSP`，绝不碰 `TSP1923`**；脚本内置守卫：上传前记录
+>    `data` 文件数与 `account.json` 数，上传后必须一致（实测 2155/21 前后相同，`bad=0`）。
+> 2. `python G:\TSP\_deploy\rebuild_0348.py` —— 只 `sed` 改 923 compose 的 image tag，
+>    然后把「build → kill/rm → compose up -d → 轮询 CONTAINER_UP → 清理旧 `tsp-nas:*`」整段
+>    用 `setsid nohup` 脱离 SSH 执行（J1900 上 recreate 可能超过 SSH 超时），日志轮询 `SCRIPT_DONE`。
+>    **清理镜像只匹配 `^tsp-nas:` 且排除 0.3.48，绝不碰 `tsp1923:*`，也不跑全局 `image prune -f`**。
+>    实测 build 190s、`UP_RC=0`、`CONTAINER_UP`、`tsp-nas:0.3.47` 被 Untagged+Deleted。
+> 3. 冷启动轮询 `/health`（J1900 约 30~40s）→ `version=0.3.48 / mode=free`。
+> 4. `python G:\TSP\_deploy\verify_0348_unified.py` → **TOTAL FAILS: 0 / RESULT: PASS**（19 项）。
+>
+> **验收要点**：923 跑 `tsp-nas:0.3.48` 且 Up；1923 `TSP1923_Panel/tsp1923:0.3.48` Up 4 hours **未被影响**；
+> `data` 卷 **21 个 `account.json`** + `auth.json`(15838→15909 B，容器自己写的) 全在；镜像内
+> `paper_plans.SUGGESTED_CAP_ENABLED=True` 且实测 `suggested_exposure_pct=36.2`；
+> 21 个账户 `compare` 正常带 `day_pnl/day_pnl_pct`；24 个 zdk 策略 `load_errors=0`；
+> 风险雷达 7 指数 `as_of=2026-11-11`；择时 `risk_off/exposure=0.35`；`advice=36.2`；
+> 计划 4 条名称 4/4；账户总览 `price_source=live`。
+>
+> **新功能｜建议上限 = 硬闸门（超了就一分不买）**：每笔自动买入前算「这笔成交后 持仓市值 ÷ 总资产」，
+> 超过今日上限就**这一笔不买**（不缩量、不拒单报错、不清老仓），计划留 `pending` 等下轮，
+> 原因写进 `last_error`：「今日上限 36.2% (择时×情绪×外围): 买入后仓位将超限, 本次不买入;
+> 已有持仓不受影响, 降仓由计划触发」。只拦「自动跟单 + 计划驱动」两条自动买入；手动下单不受限；
+> **卖出永远不受择时/风险影响**（铁律不变）。上限 = `clamp(择时×情绪×外围, 0.15, 1.20)×100`，
+> 用 `trend_timing(_heal=False)` 只读本地 + 60s 缓存，**买入热路径绝不联网自愈**。
+> 总开关 `backend/app/strategy/paper_plans.py` 的 `SUGGESTED_CAP_ENABLED`。
+>
+> **回滚点**：fork `zdklrr/tick-stock-panel` main = `9569e89a4b29ad3bd879701650d4bb4a18c34aeb`，
+> tag `tsp-custom-v0.3.48`（上一版 `tsp-custom-v0.3.47` 保留）。想退回 0.3.47：
+> 本地源码用 `G:\tick_stock_panel`（干净 0.3.47），NAS 则 `sed` compose tag 回 `tsp-nas:0.3.47` 后 `compose up -d`
+> （但 0.3.47 镜像已在本次清理中删除，需重新 build）。
+>
+> **提醒**：0.3.48 的上游 `kline_sync.py` 是大重构（1869→1663 行），923 是写入端，
+> **升级后第一个盘后数据管道要盯 `docker logs`**；另 923 升级后同样带上 1923 的 `000300.SH`
+> 10 天窗口已知限制（见下文专节）。
 >
 > **v0.3.48 新增｜完整移植上游 0.3.34 + 独立 1923 部署**：
 >
@@ -8,14 +63,14 @@
 > 并明确「不影响改过的功能可以直接移植、会影响的列出来让我选择」。本版是**在全新工作区 `G:\TSP` 里**做的，
 > 旧目录 `G:\tick_stock_panel` 仍是干净的 0.3.47，两个 NAS 实例并行运行、互不干扰。
 >
-> | 项目 | 923 生产实例（保持原样） | 1923 新实例（本版） |
+> | 项目 | 923 生产实例 | 1923 并行实例 |
 > |---|---|---|
 > | 访问地址 | `http://<NAS_LAN_IP>:923` | `http://<NAS_LAN_IP>:1923` |
-> | 版本 | **0.3.47** | **0.3.48** |
+> | 版本 | **0.3.48**（2026-11-11 由 0.3.47 升级，见文首统一升级节） | **0.3.48** |
 > | 源码目录 | `/volume1/docker/TSP/src/tick-stock-panel-main` | `/volume1/docker/TSP1923/src/tick-stock-panel-main` |
 > | compose 目录 | `/volume1/docker/TSP` | `/volume1/docker/TSP1923` |
 > | 容器名 | `TickFlow_Stock_Panel` | `TSP1923_Panel` |
-> | 镜像 | `tsp-nas:0.3.47` | `tsp1923:0.3.48` |
+> | 镜像 | `tsp-nas:0.3.48` | `tsp1923:0.3.48` |
 > | 宿主端口 → 容器内 | `923 → 3018` | `1923 → 3018` |
 > | data 目录 | `/volume1/docker/TSP/data` | `/volume1/docker/TSP1923/data` |
 > | compose 项目名 | `tsp`（由目录推导） | `-p tsp1923`（显式指定） |
@@ -46,9 +101,9 @@
 >    `frontend/src/components/data`(27 模块)，导致 `pnpm build` 报 `TS2307`。改为只锚定根级 `data`/`backend/data`，
 >    `.dockerignore` 同步改 `/data` + `/backend/data`；重传 source files 1343→**1371**，二次 `BUILD_RC=0`。
 > 6. **验收 `verify_1923.py` → FAILS=0**：1923 `/health`=0.3.48、`/api/data/version`=v0.3.48、
->    `/api/risk/radar` 可用；1923 容器/镜像/端口/挂载全部隔离，923 与 1923 data 目录 inode 不同、marker 不泄漏；
->    **923 容器 ID `a6c4319601b3bf2ac7cdede8ec95711461af60e833fc0f0f04b175076b4f3eba`、镜像 `tsp-nas:0.3.47`、
->    StartedAt `2026-11-10T06:35:55.888865647Z` 三项全部未变**（从未重启，923 `/health` 仍 0.3.47）。
+>    `/api/risk/radar` 可用；1923 容器/镜像/端口/挂载全部隔离，923 与 1923 data 目录 inode 不同、marker 不泄漏。
+>    （注：此条记录的是**1923 首部署时**的 923 基线——当时 923 是 0.3.47。**2026-11-11 20:00 起 923 也已升到 0.3.48**，
+>    见文首「v0.3.48 统一升级」节；升级后 923 容器与镜像均为 0.3.48，1923 未受任何影响。）
 > 7. **`mode=none` 已解决（1923 共用 923 的数据源与日K）**：见下方「**v0.3.48 补充｜923 → 1923 数据同步**」一节。
 >    1923 原本是全新空 data 目录、没配数据源，`/health` 的 `mode=none`，打开个股详情会报「日K数据源获取失败」。
 >    现已一次性共享 923 的 `capabilities.json` / `secrets.json` / `preferences.json` 让 1923 变 `mode=free`，
@@ -70,9 +125,11 @@
 > | 何时重启 1923 | 仅当「有新增 parquet 文件」或「维表内容变化」时 `docker restart TSP1923_Panel`（重建 Polars 内存缓存 / DuckDB 视图 / `get_name_map` 缓存）；稳态（无新文件）跳过重启。脚本内 `flock` 防重入、日志封顶 2MB |
 > | 关键脚本 | `G:\TSP\_deploy\sync_from_923.sh`（同步本体，也部署到 NAS）、`setup_data_sync.py`（`--apply` 一次性落地 + `--verify` 18 项验收）、`verify_1923.py`（实例隔离验收） |
 >
-> - **验收 `setup_data_sync.py --verify` → 18/18 PASS**：923 容器 ID / StartedAt / Image / Status 全部未变、
+> - **验收 `setup_data_sync.py --verify` → 18/18 PASS**（记录于 923 仍是 0.3.47 时）：923 容器 ID / StartedAt / Image / Status 全部未变、
 >   `/health` 仍 0.3.47；1923 `auth.json` 未变（登录 <WEB_PASSWORD> 仍可用）、`mode=free`、`kline_daily` 249 分区、
 >   `/api/kline/daily?symbol=600000.SH&days=10` 返回「浦发银行 8 行」、cron 已注册、sync.log 有完整 run。
+>   **2026-11-11 20:00 之后 923 已是 0.3.48**，同步脚本本身不受版本影响（它只 rsync 宿主上的 parquet 文件，与容器版本无关）；
+>   923 重建只换镜像、data 卷原位不动，故 cron 无需重装。
 > - **首次全量同步**：`new parquet files = 1017`（约 380MB 行情数据），923 → 1923 拉平；随后一次 v2 修正把维表
 >   改为 923 权威覆盖，重跑后 8 只抽样股票（含深市 `000001.SZ`/`300007.SZ`/`002088.SZ`/`300473.SZ`）**名称与
 >   行数全部与 923 一致**。
@@ -90,7 +147,8 @@
 > - 用 `G:\TSP\_deploy\copy_strategies_to_1923.py`（宿主侧 tar 流式复制，`--exclude=__pycache__`，**923 全程只读**）
 >   把 27 个 .py 逐字节复制到 1923，再用 `finalize_strategies_1923.py` 从 Windows 端 HTTP 登录调
 >   `POST /api/strategies/reload` 热加载 → **`{"ok":true,"count":24}`、`load_errors: []`**，
->   24 个 id 全部可用（`zdk_breakout` … `zdk_yaoxin`），1923 `/health` 仍 0.3.48、923 仍 0.3.47。
+>   24 个 id 全部可用（`zdk_breakout` … `zdk_yaoxin`），1923 `/health` 仍 0.3.48（923 当时仍 0.3.47，
+>   **2026-11-11 20:00 起也已升到 0.3.48**，且 923 的 27 个策略文件随源码树一起重传，仍在 `/volume1/docker/TSP/data/strategies/custom/`）。
 > - **没有复制「策略池勾选状态」**：0.3.47（923）的策略池选择存在浏览器 localStorage（`storage.ts` 的
 >   `strategy-pool`），服务端没有副本；0.3.48（1923）改成服务端 `data/user_data/strategy_pool.json` v2。
 >   两者存储模型不同，需要群策略的话在 1923 界面里重新勾选即可（或按 24 个 id 生成 v2 池文件）。

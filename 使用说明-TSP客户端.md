@@ -237,6 +237,47 @@
 > **v0.3.27 的变化**：新增两个免费数据源插件（腾讯行情 = 实时行情 + 五档盘口；新浪行情 = 分钟K + 全量分钟）；
 > 窗口标题栏显示版本号。
 
+> **v0.3.48 最终统一版：三处（本机 exe / NAS 923 / NAS 1923）全部 0.3.48，新增「建议上限 = 硬闸门」**
+>
+> 用户要求（逐字）：「「建议上限 = 硬闸门、超了就一分不买」这套逻辑」、「如果统一，那么版本号应该也一样」、
+> 「两个都先留着，只升级不删」。本版把原来只"显示建议"的「今日上限」变成**买入前真正拦得住**的闸门。
+>
+> | # | 变化 | 说明 |
+> |---|---|---|
+> | 1 | **今日上限 → 买入硬闸门** | 每笔自动买入前先算「这笔成交后 持仓市值 ÷ 总资产」，超过今日上限就**这一笔不买**（不缩量、不拒单报错、不清老仓），计划留在 `pending` 等下轮。原因写进计划的 `last_error`：「今日上限 36.2% (择时×情绪×外围): 买入后仓位将超限, 本次不买入; 已有持仓不受影响, 降仓由计划触发」 |
+> | 2 | **作用范围** | 只拦「自动跟单」和「计划驱动」两条自动买入路径；**手动下单不受限**；**卖出永远不受任何择时/风险影响**（铁律不变），降仓只由计划触发（止损 / 目标1 减半 / 目标2 清仓 / 策略出场） |
+> | 3 | **上限怎么算（与决策卡同源、零网络）** | `clamp(择时 × 情绪 × 外围风险, 0.15, 1.20) × 100`。择时用 `trend_timing(_heal=False)` 只读本地 parquet + 60 秒缓存，**不在买入热路径联网自愈**（历史教训：`_heal=True` 在 NAS 上会把 `/api/risk/timing` 拖到 120 秒超时） |
+> | 4 | **上限会随盘面变** | 同一账户上午盘面强时上限可能是 43.8%，下午转 `risk_off` 后掉到 36.2%——「当前仓位 57.9% > 今日上限 36.2%」是**上午建仓 + 下午转弱**的时序差，不是 bug；此时新买入被闸门挡住，老仓不动 |
+> | 5 | **总开关** | `backend/app/strategy/paper_plans.py` 的 `SUGGESTED_CAP_ENABLED = True`，置 `False` 即回到旧行为（只显示不拦） |
+> | 6 | **顺手修的健壮性 bug** | 自动跟单事件里 `price` 是 `"N/A"` 之类的脏字符串时，原代码 `price <= 0` 抛 `TypeError: '<=' not supported between instances of 'str' and 'int'`，会**崩掉整批事件**；改为 `float()` 转换失败就跳过该条 |
+>
+> **三处统一验证（2026-11-11 实测）**
+>
+> | 位置 | 版本 | 结果 |
+> |---|---|---|
+> | 本机 exe | 0.3.48 | 安装包 `G:\TSP\packaging\Output\TSP-Setup-0.3.48.exe` **135,952,089 B**，静默安装 `INSTALL_EXIT=0`，`data` 397.1 MB / 1654 文件完整保留；`/health`=0.3.48、`/api/data/version`=v0.3.48 |
+> | NAS 923（生产，21 账户） | 0.3.48 | 容器 `TickFlow_Stock_Panel` / 镜像 `tsp-nas:0.3.48`（旧 `tsp-nas:0.3.47` 已清）；`data` 卷 21 个 `account.json`、`auth.json` 全部保留；`/health`=0.3.48、`mode=free` |
+> | NAS 1923（并行） | 0.3.48 | 容器 `TSP1923_Panel` / 镜像 `tsp1923:0.3.48` **全程未动**（Up 4 hours），未被本次升级影响 |
+>
+> **NAS 923 验收 `verify_0348_unified.py` → TOTAL FAILS: 0 / RESULT: PASS**（19 项）：
+> 923 跑 `tsp-nas:0.3.48` 且 Up、1923 未动、`/health` 与 `/api/data/version` 均 0.3.48、
+> `data` 卷 21 个账户 + `auth.json` 在、镜像内 `SUGGESTED_CAP_ENABLED=True` 且实测
+> `suggested_exposure_pct=36.2`、21 个模拟账户 `compare` 正常且带 `day_pnl/day_pnl_pct`、
+> 24 个 zdk 策略 `load_errors=0`、风险雷达 7 个指数 `as_of=2026-11-11`、
+> 大盘择时 `risk_off/exposure=0.35`、`advice.suggested_exposure_pct=36.2`、
+> 计划 4 条名称 4/4 已回填、账户总览 `price_source=live`。
+>
+> **回归测试**：定向 6 文件 **105 passed**；宽回归 23 个测试文件 **433 passed**；
+> 新增 `backend/tests/test_paper_cap_gate.py` **11 例全绿**（含"上限 15% 时止损卖出照放行"这条铁律锁）；
+> 前端 `tsc -b` **0 错**、`vitest run --testTimeout=20000` **849 passed**。
+> 版本四锚点 `scripts/sync_versions.py --check` → 「版本一致: v0.3.48」。
+>
+> **回滚点**：fork `zdklrr/tick-stock-panel` main = commit `9569e89a4b29ad3bd879701650d4bb4a18c34aeb`，
+> 轻量 tag **`tsp-custom-v0.3.48`**（上一个 `tsp-custom-v0.3.47` 保留）。推送走 GitHub Git Data API
+> （本机 git smart-HTTPS 长连接被网络重置，改用 `curl --ssl-no-revoke`）；推送副本里 NAS IP/SSH 用户/密码/Web 密码已脱敏，本地文件不动。
+>
+> **两个源码文件夹都保留**：`G:\TSP`（0.3.48，当前主用）与 `G:\tick_stock_panel`（0.3.47，干净回退副本）都不删。
+
 ---
 
 ## 一、怎么启动（三种方式，任选其一）
@@ -250,7 +291,7 @@
 > 安装版位置：`C:\Users\jiangliuer\AppData\Local\Programs\TSP`
 > 卸载：开始菜单 → TSP → 卸载 TSP（或 设置 → 应用）
 
-启动后是一个原生窗口（WebView2 内核，1440×900），标题栏写着 `TSP v0.3.32`。
+启动后是一个原生窗口（WebView2 内核，1440×900），标题栏写着 `TSP v0.3.48`。
 后端 uvicorn 只监听 `127.0.0.1:3018`，不对外开放端口。窗口关闭即退出。
 
 > **升级后版本号没变？** 先确认窗口标题或 设置 → 关于 页。如果还显示旧版本，
