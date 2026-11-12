@@ -1,6 +1,56 @@
 # TSP 面板 — NAS 部署说明
 
-> 部署时间：2026-11-11 · 版本 **v0.3.48**（**三处统一**：本机 exe / NAS 923 / NAS 1923 全部 0.3.48；923 与 1923 两个独立实例并行运行）
+> 部署时间：2026-11-11 · 版本 **v0.3.48**（NAS 两实例）；本机 exe 已到 **v0.3.51**（实盘功能只在本机，NAS 不升级）
+>
+> **v0.3.51 说明（2026-11-12）｜同花顺拷贝保护过验证码，仍只影响本地 exe，NAS 不动**
+>
+> 0.3.50 修好前台争用后，读持仓/委托/成交仍失败（资金能读）。根因是同花顺对**表格拷贝**有保护：
+> 一发 `^A^C`（或 `WM_COMMAND 0xE122`）就弹 `#32770` 验证码框，剪贴板里是诱饵串。
+> 修法三件套：①用 Windows 自带 OCR（`winsdk`/WinRT）替代未安装的 tesseract
+> ②必须用 `EnumWindows` 找到**真实**的 `#32770` 对话框 hwnd（`top_window()` 拿到的不是它，这是前几轮全失败的首因）
+> ③填框必须 `AttachThreadInput`（`SetFocus` 是线程局部的；实测不 attach 5/5 失败、attach 后 6/6 通过）。
+> 详见 `使用说明-TSP客户端.md` 的 v0.3.51 节。
+>
+> **对本机 exe 的新增要求**：GUI 自动化必须有**活动桌面** —— 锁屏 / RDP 断开 / 切换用户时读数据全失败，
+> 提示「当前没有可用的桌面会话…请解锁屏幕后重试」。另 `tsp.spec` 需 `collect_submodules("winsdk")`。
+>
+> | 位置 | 版本 | 本次动作 |
+> |---|---|---|
+> | 本机 exe（`%LOCALAPPDATA%\Programs\TSP`） | **0.3.51** | 静默覆盖安装（装区 `data/` 保留） |
+> | NAS 923 `http://<NAS_LAN_IP>:923` | 0.3.48 | 不动 |
+> | NAS 1923 `http://<NAS_LAN_IP>:1923` | 0.3.48 | 不动 |
+>
+> **v0.3.50 说明（2026-11-12）｜只修本地 exe 的实盘页，NAS 仍 0.3.48 不动**
+>
+> 0.3.50 修的是「实盘页读取资金 100% 报 `SetForegroundWindow` 失败」——根因是 TSP 自己的
+> WebView2 窗口占着前台，Windows 不许非前台进程抢焦点，而 easytrader 切页要用
+> `SetForegroundWindow`。修法是 `AttachThreadInput` 附加到前台线程再抢焦点，并同时 patch
+> 三处（`pywinauto.win32functions` / `easytrader.utils.win_gui` / `HwndWrapper.set_focus`）。
+> 详见 `使用说明-TSP客户端.md` 的 v0.3.50 节。
+>
+> **这是纯本机 GUI 层的修复，与 NAS 无关**：NAS 两个实例（923 / 1923）保持 **0.3.48** 不动，
+> 无需任何升级或重建动作；923→1923 每天 16:30 的行情同步照常。
+>
+> | 位置 | 版本 | 本次动作 |
+> |---|---|---|
+> | 本机 exe（`%LOCALAPPDATA%\Programs\TSP`） | **0.3.50** | 静默覆盖安装（装区 `data/` 保留） |
+> | NAS 923 `http://<NAS_LAN_IP>:923` | 0.3.48 | 不动 |
+> | NAS 1923 `http://<NAS_LAN_IP>:1923` | 0.3.48 | 不动 |
+>
+> **v0.3.49 说明（2026-11-12）｜实盘功能只在本地 exe，NAS 两个实例不动**
+>
+> 0.3.49 新增的「实盘交易」页是用 easytrader 驱动**本机同花顺 Windows 客户端**（GUI 自动化），
+> NAS 是 Linux 容器、没有桌面环境，**跑不了这个功能**。因此：
+>
+> | 位置 | 版本 | 说明 |
+> |---|---|---|
+> | 本机 exe（`%LOCALAPPDATA%\Programs\TSP`） | **0.3.49** | 新增「实盘交易」页（`/live`） |
+> | NAS 923 `http://<NAS_LAN_IP>:923` | 0.3.48 | 保持不动，无实盘入口 |
+> | NAS 1923 `http://<NAS_LAN_IP>:1923` | 0.3.48 | 保持不动，无实盘入口 |
+>
+> NAS 侧无需任何升级动作；923→1923 的每天 16:30 数据同步照常运行（同步的是行情 parquet，与版本无关）。
+> 实盘配置存在本机 `data/user_data/extensions/live_trader/`（`config.json`/`state.json`/`live_orders.jsonl`），
+> 不在 NAS 上、也不会被同步。
 >
 > **v0.3.48 统一升级（2026-11-11 20:00）｜923 从 0.3.47 升到 0.3.48，三处版本号一致**
 >
@@ -1045,7 +1095,7 @@ return Math.min(Math.max(width, minWidth), maxWidth)
 >    绝对路径**（`/tmp/xxx.sh` 或 `/volume1/docker/TSP/xxx.sh`），再
 >    `sudo -S -p '' bash -c 'setsid nohup bash /tmp/xxx.sh >/dev/null 2>&1 </dev/null &'`
 >    **脱离会话**执行，日志写文件后轮询读取。**不要**在 SSH 通道里直接跑耗时的 docker 命令。
-> 2. **daemon 真的卡死时�� `synopkg restart ContainerManager`**（脚本同样要脱离会话执行）。本次它
+> 2. **daemon 真的卡死时, 用 `synopkg restart ContainerManager`**（脚本同样要脱离会话执行）。本次它
 >    悬了 6 分钟没返回，但实际已经成功重启（旧 dockerd PID 消失、新 dockerd 起来了）。
 >    重启后**先 `docker rm -f` 掉所有 `TickFlow_Stock_Panel` 相关的旧容器与残骸**，再
 >    `docker compose up -d` —— 旧容器不存在时 compose 走 create 而不是 recreate，秒级完成。

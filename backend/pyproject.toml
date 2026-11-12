@@ -1,6 +1,6 @@
 [project]
 name = "tickflow-stock-panel-backend"
-version = "0.3.48"
+version = "0.3.51"
 description = "A 股策略 + 监控 + 回测面板 — TickFlow 适配"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -43,6 +43,11 @@ dependencies = [
     # Watchlist screenshot OCR (Tesseract)
     "pytesseract>=0.3.10",
     "Pillow>=10.0",
+    # 实盘桥接 (app/custom/live_trader): easytrader 用 pywinauto 驱动同花顺下单
+    # 客户端; pywinauto 依赖完整 pywin32 (非 pywin32-ctypes) + comtypes。
+    "easytrader>=0.23.7; sys_platform == 'win32'",
+    "pywinauto>=0.6.6; sys_platform == 'win32'",
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

@@ -1,7 +1,133 @@
 # Tick Stock Panel (TSP) 桌面客户端 — 本机构建说明
 
-版本：**v0.3.48**（源码 `G:\TSP` = 上游 0.3.34 完整 rebase + 我们 0.3.47 全部定制；旧源码 `G:\tick_stock_panel` 保持干净的 0.3.47 不动，上游 https://github.com/shy3130/tick-stock-panel）
+版本：**v0.3.51**（源码 `G:\TSP` = 上游 0.3.34 完整 rebase + 我们 0.3.47 全部定制 + 0.3.49 实盘对接 + 0.3.50 前台焦点修复 + 0.3.51 同花顺拷贝保护过验证码；旧源码 `G:\tick_stock_panel` 已同步到 0.3.48，上游 https://github.com/shy3130/tick-stock-panel）
 
+> **v0.3.51 修复：同花顺「拷贝保护」弹验证码导致持仓/委托/成交读不出来**
+>
+> 0.3.50 修好前台争用后，`POST /connect` 已经 200，但 `GET /api/custom/live-trader/account` 仍 409：
+> `读取持仓失败: tesseract is not installed or it's not in your PATH.` —— **资金能读、持仓恒 0 行**。
+>
+> **根因（客户端侧的数据保护，不是我们代码的 bug）**：easytrader 读资金走的是 Static 控件文本
+> （`clienttrader.py:126-142`，不碰表格），但读持仓/委托/成交走的是**表格 grid**
+> （`:145-148 position()` → `_get_grid_data()`）。默认 grid 策略 `Copy` 用 `^A^C` 复制表格，
+> 同花顺判定为「检测到您正在拷贝数据，为保护您的账号数据安全」，弹 `#32770` 对话框要输 4 位验证码；
+> 复制到的剪贴板是**诱饵串**（实测 `atls_LISH_drive_current`，或一段无关中文），行数 0。
+> 逐条排除：`WMCopy`（改发 `WM_COMMAND 0xE122`，**同样弹**）、`Xls`（走 `^s` 另存，
+> `MatchError: Could not find 'Edit1'`）、把同花顺自己顶到前台（**一样弹**）、静默 120 秒冷启动（**一样弹**）、
+> MSAA（`childCount=0`）/ UIA（`children=0`，虚拟表格不暴露）、`xiadan.ini` 里没有拷贝保护开关。
+> zdk 选股软件也没解决 —— 它 `config.py:1382 TRADE_MODE="simulate"`，默认跑模拟盘。
+>
+> **修法（三段，全部实测验证）**：
+>
+> | # | 修法 | 为什么必须这样 |
+> |---|---|---|
+> | 1 | **Windows 自带 OCR 替代 tesseract**：`install_captcha_shim()` 同时替换 `easytrader.utils.captcha.captcha_recognize` 与 `easytrader.grid_strategies.captcha_recognize`（后者在 import 时已绑定名字，只改前者无效）。实现走 `winsdk`（WinRT `OcrEngine.try_create_from_user_profile_languages()`），**必须落盘 PNG 走 `StorageFile.get_file_from_path_async`**（内存 BGRA 报 `OSError: [WinError -2003292336]`）；原图直接认返回空串，**放大 4 倍 + 转灰度**后 11/11 变体全部正确 | tesseract 未装；`ddddocr` 装不上（`onnxruntime` 不支持 Python 3.12） |
+> | 2 | **必须用真实对话框 hwnd**：`user._app.top_window()` 拿到的**不是**那个 `#32770` 验证码框 → 截不到图、填不进框、点不中按钮。改用 `EnumWindows` 找 `class == "#32770"` 且含 `Static` 文本「先输入验证码」+ `Edit` 子控件的那一个（`find_captcha_dialog()`） | 这是前几轮全部失败的**首要原因** |
+> | 3 | **必须 `AttachThreadInput` 才能填框**：`SetFocus` 是线程局部的，一个线程只能把焦点设给自己输入队列里的窗口；对话框属 xiadan.exe 线程，直接 `SetFocus` 静默失败 → `SendKeys` 打到别处 → Edit 空 → 点「确定」过不了。`fill_with_attach()` = `AttachThreadInput(cur, tgt, True)` → `SetForegroundWindow(GetParent)` + `SetFocus` → `SendKeys("^a{DEL}")` + `SendKeys(code)` → `SendMessageW(ok_btn, BM_CLICK)` → finally 分离 | **实测：不 attach 连续 5 次全失败；attach 后 6/6 一次通过** |
+>
+> 另加 `CaptchaAwareCopy(WMCopy)` 作为 grid 策略：`post_message(WM_COMMAND, 0xE122)` → `pass_captcha()` → 过了再读剪贴板 → `_format_grid_data`，无行则重试 3 次。
+>
+> **踩坑记录（省下后来人的时间）**：`GetWindowTextW` 跨进程读子控件**永远返回空串**，
+> 所以「填完回读 Edit 是空的」是**假阴性** —— 字其实填进去了，我因此误判了好几轮。
+>
+> **实测通过（同花顺真机，只读）**：`connect 7.0s` / `positions 5.9s n=1`（000547 航天发展 7500 股，
+> 可用 7500 / 成本 22.165 / 现价 12.86）/ `entrusts 5.2s n=0`（当日委托页只有空白模板行）/
+> `trades 5.1s n=24` / `balance 1.3s`（总资产 106,375.44 / 可用 9,925.42 / 市值 96,450.00）。
+> 回归 **73 passed**（broker 从 23 例扩到 37 例）。
+>
+> **第四个真 bug（页面串台）**：持仓 / 委托 / 成交**三张表共用同一个 grid 控件**，表格内容取决于客户端
+> 当前停在哪一页；切页慢一点就会读到上一页的表格 —— 实测「读持仓」返回了 24 行「当日成交」的数据，
+> 因为没有「股票余额」列，全部字段被映射成 `qty=0 / price=0`，界面上显示成一堆 0 股持仓。
+> 修法双保险：①`build_grid_strategy(expect_columns=...)` 做列名校验，不匹配就回调 `_switch_left_menus(path)`
+> 重新切页再复制（最多 4 次）②三张表的映射循环里再兜一层「缺关键列就丢弃该行」。
+>
+> **第五个真 bug（委托记录空行）**：连接 / 断开 / 撤单事件和镜像委托**写在同一个 `live_orders.jsonl`** 里，
+> 它们没有 `symbol / side / qty` 字段，列表渲染出 4 条「— / 跳过」空行。修法：`recent_orders()` 只返回
+> `event == "mirror"` 的条目。回归 **80 passed**。
+>
+> **已验收（0.3.51 安装后实测，TSP 占前台这个曾经 100% 失败的场景）**：
+> `POST /connect` → **200 / 29s**、`GET /account` → **200 / 9s**（总资产 106,375.44 / 可用 9,925.42 /
+> 市值 96,450.00 / 持仓 1 条 000547 航天发展 7500 股）。前端 `/live` 页面用 CDP 截图确认：
+> 导航「实盘交易」在、客户端已连接（窗口标题 + exe 路径 + 连接时间）、真实账户 5 卡有数字
+> （总资产 10.64 万 / 可用 9,925.42 / 市值 9.64 万 / 可取 1,924.49 / 持仓 1）、持仓表一整行
+> （000547.SZ 航天发展 7500 / 7500 / 22.165 / 12.860 / 9.64 万 / -6.98 万 -41.98% / -2,496.00 / 90.67）、
+> 镜像配置默认「启用镜像」关闭 + 「演练模式」开启（安全默认）、20 个可镜像账户可选。
+
+
+>
+> **顺带修的真 bug**：①`frozen = max(0, qty - available)` —— 客户端「冻结数量」列**恒为 0 不可信**
+> （000547 余额 7400 / 可用 6600 显然有 800 股 T+1 冻结）②`from_ths_symbol` 加 `market` 参数用「交易市场」列校正
+> （`118050` 航宇转债在上海，按 `1` 开头会误判深圳）③**国债逆回购特判** `204*` → `.SH`、`1318*` → `.SZ`
+> （`204001` GC001 在上海，不特判会被判成 `.SZ`）④委托 grid 末尾有一整行空行（证券代码为空）必须过滤。
+>
+> **本版前提条件**：GUI 自动化**必须有活动桌面**。锁屏 / RDP 断开 / 切换用户时全部失败，
+> 报 `There is no active desktop required for moving mouse cursor!`，已翻译成中文提示。
+> 打包侧 `tsp.spec` 增加 `collect_submodules("winsdk")`（运行时动态导入，静态分析看不见）。
+>
+> **v0.3.50 修复：实盘页「读取资金失败」(SetForegroundWindow) —— TSP 自己占前台导致的必现 bug**
+>
+> 0.3.49 实装后实测：`POST /connect` 成功（42 秒），但紧接 `GET /api/custom/live-trader/account`
+> **100% 报 409** `读取资金失败: (0, 'SetForegroundWindow', 'No error message is available')`。
+>
+> **根因（不是同花顺的问题，是 Windows 前台锁）**：easytrader 读资金前要切到「查询[F4] → 资金股票」页，
+> 靠 `pywinauto` 的 `type_keys` 发按键，而 `type_keys` 内部走
+> `hwndwrapper.HwndWrapper.set_focus` → `win32gui.SetForegroundWindow`。
+> Windows 只允许**当前前台进程**调用 `SetForegroundWindow`；TSP 自己是 pywebview/WebView2 桌面壳，
+> 一跑起来就占着前台，于是 broker 线程（Python 子线程，非前台）**每次都失败**。
+> 试过 `AllowSetForegroundWindow(ASFW_ANY)` + `SPI_SETFOREGROUNDLOCKTIMEOUT=0` —— **无效**。
+>
+> | # | 修法 | 说明 |
+> |---|---|---|
+> | 1 | `force_foreground(hwnd)`：先 `AttachThreadInput(前台线程, 自己线程, True)` 把自己挂到当前前台线程的输入队列上（这条限制就失效了），再 `BringWindowToTop` + `SetForegroundWindow` + `SetFocus`，finally 一定要 `AttachThreadInput(..., False)` 分离 | 核心手法 |
+> | 2 | `install_foreground_shim()` **必须覆盖三处**，少一处就漏：①`pywinauto.win32functions.SetForegroundWindow` ②`easytrader.utils.win_gui.SetForegroundWindow`（它在 import 时就把名字绑死了，光改①无效）③`pywinauto.controls.hwndwrapper.HwndWrapper.set_focus`（自己 `import win32gui` 直接调，不走①②，`type_keys` 用的正是它） | 覆盖面 |
+> | 3 | 第③处抢到焦点后**补 `time.sleep(Timings.after_setfocus_wait)`** 再返回 —— pywinauto 原本在 `set_focus` 末尾有这一步，跳过会让紧随的 `type_keys` 打在没生效的焦点上 | 时序 |
+> | 4 | shim 在 `_do_connect` 里 `easytrader.use("ths")` 之后、`user.connect()` **之前**安装（connect 本身就要抢焦点）；`_SHIM_INSTALLED` 幂等，重复调用不重复包裹 | 安装时机 |
+> | 5 | 顺带把原始异常翻译成人话：`_gui_error(action, exc)` 三分支 —— 含 `SetForegroundWindow` → 「无法把同花顺窗口切到前台 (可能被其它程序占着)」；含 `float() argument` → 「界面数据读不到 (通常是没有登录, 或停在非「资金股票」页面)」（客户端半登录时 Static 控件读到空串，easytrader 直接 `float(None)` 崩溃，原来完全看不出原因）；含 `not responding` → 「客户端正忙 (可能弹了对话框)」 | 可读性 |
+>
+> **A/B 对照实验（决定性证据，TSP 主窗口先被顶到前台再测）**：
+> - 不装 shim → `[without-shim] FAIL: 客户端响应超时 (60 秒)` → **RESULT: FAIL**
+> - 装 shim → `[with-shim] balance OK in 1.4s total=106629.69 cash=270.74` → **RESULT: OK**
+>
+> 另有一个旁证：普通 `SetForegroundWindow` **连 TSP 自己的窗口都顶不到前台**（`probe_tsp_windows.py --raise` 后
+> `fg` 仍是同花顺），必须同样用 AttachThreadInput 才成功 —— 同一个限制的两面。
+>
+> 回归：`pytest test_live_trader.py test_live_trader_api.py test_live_trader_broker.py` → **57 passed**（broker 从 13 例扩到 23 例）；
+> 真机端到端 `_verify/e2e_foreground_shim.py` → **TOTAL FAILS: 0**（connect 4.1s / balance 107,311.97 / positions 2 / entrusts 37）。
+>
+> **注意**：GUI 自动化有固有抖动，偶发两类**可重试**错误 —— ①`OpenClipboard 拒绝访问`（easytrader 用剪贴板读表格，被别的程序占着，重试即过）
+> ②`Window is not responding`（客户端正在切页）。这两类都不是本版 bug。
+>
+> **v0.3.49 新增：实盘对接（用同花顺客户端真下单，只在本地 exe）**
+>
+> 用户要求（逐字）：「可以参考一下 zdk 选股策略软件，那个软件应该增加了实盘功能，可以测试一下能不能用，
+> 我们这个项目我也想添加一下实盘功能」；两次确认选择：**全自动下单**（信号一出就下单，不需人工点确认）、
+> **只在本地 exe**（NAS 是 Linux 无桌面，跑不了 GUI 自动化，923/1923 两个实例保持 0.3.48 不动）。
+>
+> | # | 做法 / 修法 | 影响面 |
+> |---|---|---|
+> | 1 | **零侵入新增后端扩展 `backend/app/custom/live_trader/`**：`broker.py` 封装 easytrader（本机同花顺 `xiadan.exe`），`service.py` 做镜像与闸门，`routes.py` 挂 `/api/custom/live-trader/*`。**没有改 `paper.py` / `api/paper.py` 任何一行**，走 0.3.48 上游的 L2 扩展契约（`EXTENSION_ID="official.live-trader"`，`setup(registrar)` 自动装载） | 后端 |
+> | 2 | **easytrader 调用全部钉在单条守护线程** `live-trader-broker`（`pythoncom.CoInitialize()` + `queue.Queue` + `Future`）：同花顺客户端是 GUI/COM 对象，多线程并发操作会直接崩，因此所有连接/读资金/读持仓/下单串行化，调用方带超时（读 30s、下单 60s） | 线程模型 | |
+> | 3 | **`connect()` 要传 exe 路径，不是窗口标题**：easytrader 0.23.7 的签名是 `connect(exe_path)`；zdk 用的 `connect(窗口标题)` 是旧 API，照抄会报 `ProcessNotFoundError`。默认路径 `F:\软件安装\同花顺\同花顺\xiadan.exe`，页面可改 | 连接 | |
+> | 4 | **下单必须带 `sh`/`sz` 前缀**：`user.buy("sh600000", price, amount)` —— easytrader 只按前缀切换「上海Ａ股/深圳Ａ股」下拉框，纯 6 位代码不会切市场，会打到错误市场 | 下单 | |
+> | 5 | **修掉两个真实数据 bug（实测同花顺持仓表后发现）**：①客户端「冻结数量」列恒为 0 不可信 → 改用 `frozen = 持仓 - 可用`（`000547` 余额 7400/可用 6600，T+1 冻结 800）②按代码段推断交易所会把 `118050` 航宇转债（上海）误判成深圳 → 改为优先用客户端「交易市场」列（`上海Ａ股`/`深圳Ａ股`/`北京Ａ股`），无该列才退回代码段规则 | 持仓读取 | |
+> | 6 | **六道安全闸门**（`_decide` 顺序判定，任一不过就跳过并记原因）：①总开关 `enabled`（默认关）②**默认演练模式 `dry_run=true`**（只记录不发单）③订单来源白名单（**默认只镜像 `plan:` 计划驱动与 `auto` 自动跟单，手动下单不镜像**）④当日发单上限（默认 10 笔）⑤单笔金额上限（默认 2 万）⑥未连接客户端跳过。另有 `allow_sell` 开关（默认允许卖出） | 风控 | |
+> | 7 | **两套账务完全隔离**：镜像结果只写扩展自己的 `data/user_data/extensions/live_trader/live_orders.jsonl`，**绝不修改模拟盘的订单/持仓/净值**；模拟盘的盈亏永远是模拟价，实盘账务以同花顺客户端为准 | 数据隔离 | |
+> | 8 | **铁律继承**：卖出数量原样透传，**永不受大盘择时/情绪周期缩放**（择时只作用于买入股数与只数上限）；镜像侧不做任何二次缩放，模拟盘算多少就发多少 | 风控铁律 | |
+> | 9 | **前端新增「实盘交易」页**（`frontend/src/custom/live/`，路由 `/live`，侧栏「实盘交易」）：连接/断开同花顺、真实账户 5 卡（总资产/可用/市值/可取/持仓只数）、持仓表 9 列（含 T+1 可卖变色）、镜像配置区（3 个开关 + 4 个数字 + 账户多选）、镜像委托记录表、两个二次确认弹窗；**开启实盘镜像与「全部撤单」都要在弹窗里确认**，开启且非演练时页面顶部常驻红色危险横幅 | 前端 | |
+> | 10 | **打包**：`pyproject.toml` 追加 `easytrader`/`pywinauto`/`pywin32`（`sys_platform == 'win32'` 条件依赖，Linux 上不装）；`packaging/tsp.spec` 对三个包 `collect_submodules` + 补 `pythoncom/pywintypes/win32api/win32con/win32gui/win32process` hiddenimports | 依赖/打包 | |
+>
+> **同花顺客户端实测（2026-11-12，真实账户只读验证）**：
+> 连上主窗口「网上股票交易系统5.0」；`balance` = 资金余额 285.91 / **可用金额 11,526.72** / 可取 285.91 / 股票市值 97,384.00 / **总资产 108,911.41**；
+> 持仓 2 条：`000547.SZ 航天发展` 7,400 股（可用 6,600，T+1 冻结 800）成本 22.289 现价 13.16 盈亏 -40.958%；
+> `118050.SH 航宇转债` 0 股。端到端只读验证脚本 `_verify/e2e_live_readonly.py` **TOTAL FAILS: 0**。
+>
+> **已知限制（务必知道，这是 easytrader 方案的天花板，不是本版 bug）**：
+> ①**只发单，不追价**：下的是限价单、价格取当时最新价，跑掉就挂不上，程序不会追；②**不确认成交、不自动撤单**：
+> `buy()` 返回成功只代表客户端没报错（拿到委托号），是否成交要去客户端看；③**依赖客户端窗口**：同花顺升级/改名/
+> 弹模态框都会让下单失败，运行时请把客户端保持在看得见、不最小化的状态；④**单笔 3–5 秒**：GUI 操作慢，
+> 打板类策略根本来不及，需要 L2 逐笔或 miniQMT 权限；⑤**只能在本地 Windows exe**，NAS 无桌面用不了。
+> 上线顺序建议：先开「演练模式」跑一两天看记录对不对 → 再关演练、把当日发单上限设成 1–2 笔试水 → 确认无误后放开。
+>
 > **v0.3.48 相对 0.3.47 的变化（完整移植上游 0.3.34 的 53 个提交，但不丢我们改过的功能）**
 >
 > 用户要求：把原项目更新的东西完善进来，但「不影响改过的功能的直接移植、会影响的列出来让我选择」，并指定「重新复制到 `G:\TSP`，在这个文件夹里改，部署到 NAS 用端口 1923，选第二项：完整 rebase 再叠加定制」。本版按此执行。

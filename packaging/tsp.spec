@@ -125,6 +125,33 @@ if sys.platform == "win32":
 hiddenimports += collect_submodules("plyer")
 hiddenimports += collect_submodules("plyer.platforms")
 
+# ── 实盘桥接驱动 (easytrader / pywinauto / comtypes / pywin32) ────────
+# app/custom/live_trader/broker.py 在专用 broker 线程里 `import easytrader`
+# 与 `import pythoncom`, 都是运行时动态导入 — 静态分析看不见。缺包时
+# live_trader 扩展只在「连接同花顺」时抛 BrokerError (主应用不受影响), 但
+# 打包缺依赖会让实盘页永久连不上, 故显式声明。这些包只在 Windows 存在。
+if sys.platform == "win32":
+    for _pkg in ("easytrader", "pywinauto", "comtypes"):
+        try:
+            hiddenimports += collect_submodules(_pkg)
+        except Exception:  # noqa: BLE001 - 包不存在时静默跳过
+            pass
+    hiddenimports += [
+        "pythoncom",
+        "pywintypes",
+        "win32api",
+        "win32con",
+        "win32gui",
+        "win32process",
+    ]
+    # 验证码识别用 Windows 自带 OCR (WinRT): broker.py 里 `import winsdk` 是
+    # 运行时动态导入, 静态分析看不见。缺它只会让「读取持仓/委托/成交」失败
+    # (同花顺拷贝保护弹验证码时过不去), 资金仍可读, 故静默跳过不影响主应用。
+    try:
+        hiddenimports += collect_submodules("winsdk")
+    except Exception:  # noqa: BLE001 - 包不存在时静默跳过
+        pass
+
 # ── uvicorn 动态导入的模块 (loop/protocol/logging 按字符串加载) ──────
 hiddenimports += [
     "uvicorn.logging",
@@ -157,7 +184,8 @@ for pkg in (
     "tickflow",  # tickflow/__version__.py 用 importlib.metadata 读版本
     "uvicorn", "polars", "duckdb", "pyarrow", "httpx", "numpy", "pandas",
     "openai", "platformdirs", "winotify", "plyer", "apscheduler",
-    "python-dotenv", "fastexcel",
+    "python-dotenv", "fastexcel", "easytrader", "pywinauto", "comtypes",
+    "pywin32",
 ):
     datas += _safe_metadata(pkg)
 
